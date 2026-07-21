@@ -373,10 +373,6 @@ as, collected data.
 
 ## 11. Ethics and data protection
 
-This dataset contains personal data: usernames, and user-authored caption and
-comment text on a politically sensitive topic involving an active conflict.
-
-- `.gitignore` excludes `data/`, `downloads/` and `logs/` from version control.
 - Store the dataset only on approved institutional storage.
 - Secure ethics approval before collection, and follow your institution's
   guidance on pseudonymisation before any publication or data sharing.
