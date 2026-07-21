@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Python dependencies for the TikTok Conflict Study collector.
+#
+# Install with:   pip install -r requirements.txt
+#
+# Versions are pinned with ">=" (minimum) rather than "==" (exact) so that the
+# project keeps working on the university server, which may ship slightly
+# different patch releases. If you need byte-for-byte reproducibility for a
+# publication, freeze the exact versions with:  pip freeze > requirements.lock
+# ---------------------------------------------------------------------------
+
+# HTTP client used to talk to the TikTok Research API and to download .mp4
+# files. Chosen over the standard library's urllib because it handles
+# connection pooling, timeouts and streaming downloads far more readably.
+requests>=2.31.0
+
+# Loads secrets (API keys) from a local .env file into environment variables,
+# so that no credential is ever hard-coded into a .py file that gets committed
+# to version control or handed to a reviewer.
+python-dotenv>=1.0.0
+
+# Adds automatic retry-with-backoff to requests. TikTok rate-limits research
+# accounts aggressively; without backoff a long collection run will die.
+urllib3>=2.0.0
+
+# Language identification, used to enforce the study's English-only criterion.
+#
+# This is a REQUIRED dependency, not a convenience. The TikTok Research API's
+# video-query endpoint has no language filter - it accepts conditions on only
+# eleven fields, none of which describes language - so the criterion must be
+# applied locally to the caption text after retrieval. Without this package the
+# pipeline logs a warning and keeps posts in every language.
+#
+# See src/language.py for why filtering by region_code was rejected as an
+# alternative (it would systematically exclude English posts from the conflict
+# region itself).
+langdetect>=1.0.9
+
+# ---------------------------------------------------------------------------
+# OPTIONAL - only needed when SERVER_TRANSFER_MODE=sftp in the .env file.
+# Uncomment before deploying to the college server if SFTP upload is used.
+# ---------------------------------------------------------------------------
+# paramiko>=3.4.0
