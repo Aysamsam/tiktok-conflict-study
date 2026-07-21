@@ -1,8 +1,7 @@
 # TikTok Conflict Study — Data Collection Pipeline
 
 A documented, reproducible collector for TikTok posts and comments relating to
-the Israel–Iran conflict, built for academic research and written to be read
-and reviewed rather than merely executed.
+the Israel–Iran conflict, built for academic research.
 
 **Study window:** 1 April 2026 – 31 July 2026 · **Language:** English ·
 **Hashtags:** `#IsraelIran`, `#IsraelIranWar`, `#Iranwar`, `#Iran`
