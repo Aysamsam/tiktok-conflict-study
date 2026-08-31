@@ -1,39 +1,27 @@
 """
 Live data source: the official TikTok Research API.
 
-WHAT THIS IS
-------------
 TikTok operates a Research API for academic institutions
 (https://developers.tiktok.com/products/research-api/). Access requires an
-approved application from a qualifying institution. It is the only route to
+approved application from a qualifying institution - the only route to
 TikTok data that is both permitted by TikTok's terms and defensible to an
-ethics board, which is why this project targets it rather than web scraping.
+ethics board.
 
-STATUS OF THIS FILE
--------------------
-Every request is written against TikTok's published v2 specification and is
-ready to run. It cannot be exercised end-to-end until real credentials exist,
-so the module is written defensively: each response field is read through a
-helper that tolerates absence, because the API omits fields rather than
-returning nulls, and it has changed field names between versions before.
+Every request here is written against TikTok's published v2 specification.
+It cannot be exercised end-to-end without real credentials, so each response
+field is read through a helper that tolerates absence, since the API omits
+fields rather than returning nulls and has changed field names before.
 
-THE THREE ENDPOINTS USED
-------------------------
-  1. POST /v2/oauth/token/
-        Exchanges the client key and secret for a short-lived bearer token.
-  2. POST /v2/research/video/query/
-        Searches videos by hashtag, date window and language. Paginated.
-  3. POST /v2/research/video/comment/list/
-        Lists comments for one video. Paginated.
+The three endpoints used:
+  1. POST /v2/oauth/token/                          exchange credentials for a bearer token
+  2. POST /v2/research/video/query/                 search videos by hashtag, date window, language
+  3. POST /v2/research/video/comment/list/          list comments for one video
 
-THREE API CONSTRAINTS THAT SHAPE THIS CODE
-------------------------------------------
-  * A single video query may span AT MOST 30 DAYS. The study window is four
-    months, so `search_posts` splits it into consecutive 30-day chunks and
-    queries each one. This is handled automatically; the caller passes the
-    full window.
+Three API constraints shape this code:
+  * A single video query may span at most 30 days. `search_posts` splits the
+    study's 4-month window into consecutive 30-day chunks automatically.
   * Pagination is cursor-based and stateful: the response returns a `cursor`
-    and a `search_id`, and BOTH must be echoed back to get the next page.
+    and a `search_id`, and both must be echoed back for the next page.
   * Rate limits are strict. Every request goes through `_request`, which
     applies a politeness delay and retries with exponential backoff on 429.
 """
@@ -53,9 +41,8 @@ from .base import TikTokClient, TikTokClientError
 logger = logging.getLogger(__name__)
 
 
-# Fields requested from the video query endpoint. The API returns ONLY the
-# fields named here, so this list is effectively part of the study's data
-# schema. Requesting fewer fields also makes responses smaller and faster.
+# Fields requested from the video query endpoint. The API returns only the
+# fields named here, so this list is effectively part of the study's schema.
 _VIDEO_FIELDS: List[str] = [
     "id",                # -> Post.post_id
     "username",          # -> Post.username
@@ -68,37 +55,34 @@ _VIDEO_FIELDS: List[str] = [
     "comment_count",     # -> Post.comment_count
     "share_count",       # -> Post.share_count
     "favorites_count",   # -> Post.favorites_count
-    "video_tag",         # -> Post.has_ai_label / Post.ai_label_kind  (KEY FIELD)
-    "video_duration",    # not stored, but useful for sanity-checking results
+    "video_tag",         # -> Post.has_ai_label / Post.ai_label_kind  (key field)
+    "video_duration",    # not stored; used only for sanity-checking results
 ]
 
 # Fields requested from the comment endpoint.
 _COMMENT_FIELDS: List[str] = [
-    "id",                 # -> Comment.comment_id
-    "video_id",           # -> Comment.post_id
-    "text",               # -> Comment.comment_text
-    "like_count",         # -> Comment.like_count
-    "reply_count",        # -> Comment.reply_count
-    "parent_comment_id",  # -> Comment.parent_comment_id
-    "create_time",        # -> Comment.create_time
+    "id",                  # -> Comment.comment_id
+    "video_id",            # -> Comment.post_id
+    "text",                # -> Comment.comment_text
+    "like_count",          # -> Comment.like_count
+    "reply_count",         # -> Comment.reply_count
+    "parent_comment_id",   # -> Comment.parent_comment_id
+    "create_time",         # -> Comment.create_time
 ]
 
 # Field names the video-query endpoint accepts inside a query CONDITION.
-# This is NOT the same list as the response fields above, and confusing the two
-# is the single easiest way to get an opaque HTTP 400 from this API.
+# This is a different list from the response fields above - conflating the
+# two produces an opaque HTTP 400.
 #
-# Note in particular that there is NO language field here. Filtering the sample
-# to English must therefore happen locally, after retrieval - see
-# `src/language.py` and the note in `_build_search_body`.
+# There is no language field here. Filtering to English therefore happens
+# locally, after retrieval - see src/language.py and `_build_search_body`.
 _QUERYABLE_FIELDS = frozenset({
     "create_date", "username", "region_code", "video_id",
     "hashtag_name", "keyword", "music_id", "effect_id",
     "video_length", "view_count", "comment_count",
 })
 
-# TikTok caps a single video-query page at 100 results and a comment page at
-# 100. Requesting the maximum minimises the number of round trips, which
-# matters because the rate limit counts REQUESTS, not records.
+# TikTok caps a single video-query or comment page at 100 results.
 _MAX_PAGE_SIZE = 100
 
 # The API rejects any video query whose date range exceeds 30 days.
@@ -129,6 +113,7 @@ class ResearchApiClient(TikTokClient):
             comment_query_url:     Comment listing endpoint.
             request_delay_seconds: Pause inserted before each request.
             max_retries:           Attempts before abandoning a request.
+            daily_request_quota:   Requests permitted per 24h.
         """
         self._client_key = client_key
         self._client_secret = client_secret
@@ -138,23 +123,15 @@ class ResearchApiClient(TikTokClient):
         self._delay = request_delay_seconds
         self._max_retries = max_retries
 
-        # TikTok's research tier permits roughly 1000 requests per 24 hours,
-        # resetting at 00:00 UTC. Exceeding it does not merely fail - repeated
-        # abuse can put institutional access at risk. Counting requests here
-        # lets the client warn as the budget runs low and stop cleanly before
-        # it is exhausted, rather than discovering the limit as a wall of
-        # HTTP 429s mid-run.
+        # Counting requests lets the client warn as the budget runs low and
+        # stop cleanly, rather than hitting a wall of HTTP 429s mid-run.
         self._daily_request_quota = daily_request_quota
         self._requests_made = 0
 
-        # A `Session` reuses the underlying TCP connection across requests.
-        # Over a multi-thousand-request collection run this removes a full
-        # TLS handshake per call - a large saving in both time and load on
-        # TikTok's servers.
+        # Reusing a Session avoids a fresh TLS handshake on every request.
         self._session = requests.Session()
 
-        # Access tokens are short-lived (about two hours). We cache the token
-        # and its expiry, and refresh only when needed.
+        # Access tokens are short-lived (~2 hours); cached and refreshed as needed.
         self._access_token: Optional[str] = None
         self._token_expires_at: float = 0.0
 
@@ -165,9 +142,8 @@ class ResearchApiClient(TikTokClient):
     def _get_access_token(self) -> str:
         """Return a valid bearer token, refreshing it if necessary.
 
-        Uses the OAuth 2.0 *client credentials* grant: the application
-        authenticates as itself, with no end user involved. That is the correct
-        grant type for server-to-server research data collection.
+        Uses the OAuth 2.0 client-credentials grant - the correct grant type
+        for server-to-server research data collection.
 
         Returns:
             The bearer token string.
@@ -175,9 +151,8 @@ class ResearchApiClient(TikTokClient):
         Raises:
             TikTokClientError: If authentication fails.
         """
-        # Refresh 60 seconds BEFORE the stated expiry. Without that margin, a
-        # token can expire between the check and the request arriving at
-        # TikTok's servers, producing a spurious 401 mid-run.
+        # Refresh 60 seconds before the stated expiry so a token cannot
+        # expire between the check and the request arriving at the server.
         if self._access_token and time.time() < (self._token_expires_at - 60):
             return self._access_token
 
@@ -187,8 +162,7 @@ class ResearchApiClient(TikTokClient):
             response = self._session.post(
                 self._oauth_url,
                 headers={
-                    # This endpoint requires form encoding, NOT JSON - a
-                    # common and confusing source of 400 errors.
+                    # This endpoint requires form encoding, not JSON.
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Cache-Control": "no-cache",
                 },
@@ -205,8 +179,8 @@ class ResearchApiClient(TikTokClient):
             ) from exc
 
         if response.status_code != 200:
-            # The response body is deliberately NOT logged in full: on some
-            # failures TikTok echoes part of the submitted credentials back.
+            # The response body is deliberately not logged: on some failures
+            # TikTok echoes part of the submitted credentials back.
             raise TikTokClientError(
                 f"Authentication failed with HTTP {response.status_code}. "
                 "Check TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET in .env, and "
@@ -220,8 +194,6 @@ class ResearchApiClient(TikTokClient):
                 "Authentication response contained no access_token field."
             )
 
-        # `expires_in` is a duration in seconds; convert to an absolute time so
-        # the comparison above is a simple clock check.
         expires_in = int(payload.get("expires_in", 7200))
         self._access_token = token
         self._token_expires_at = time.time() + expires_in
@@ -236,8 +208,8 @@ class ResearchApiClient(TikTokClient):
     def _request(self, url: str, params: Dict[str, str], body: Dict[str, Any]) -> Dict[str, Any]:
         """Perform one authenticated POST, with retries, and return the JSON.
 
-        Every API call in this class routes through here, so rate limiting,
-        retry policy and error handling are implemented exactly once.
+        Every API call routes through here, so rate limiting, retry policy
+        and error handling are implemented exactly once.
 
         Args:
             url:    Full endpoint URL.
@@ -248,13 +220,9 @@ class ResearchApiClient(TikTokClient):
             The parsed `data` section of the response.
 
         Raises:
-            TikTokClientError: After all retries are exhausted, or on an error
-                               that retrying cannot fix (such as a 400).
+            TikTokClientError: After all retries are exhausted, or on an
+                               error that retrying cannot fix (e.g. a 400).
         """
-        # Stop cleanly at the daily quota rather than hammering the API into
-        # returning 429s. Raising here means the pipeline records everything
-        # collected so far and exits tidily; the run can resume tomorrow after
-        # the quota resets at 00:00 UTC, skipping what is already on disk.
         if self._requests_made >= self._daily_request_quota:
             raise TikTokClientError(
                 f"Daily API request quota of {self._daily_request_quota} has "
@@ -265,8 +233,6 @@ class ResearchApiClient(TikTokClient):
 
         self._requests_made += 1
 
-        # Warn once at 80% so a long run gives advance notice rather than
-        # stopping without warning.
         if self._requests_made == int(self._daily_request_quota * 0.8):
             logger.warning(
                 "80%% of the daily API quota used (%d of %d requests).",
@@ -276,10 +242,7 @@ class ResearchApiClient(TikTokClient):
         last_error = "unknown error"
 
         for attempt in range(1, self._max_retries + 1):
-            # Politeness delay before EVERY request, including the first.
-            # Being a well-behaved API consumer is both a courtesy and a
-            # practical necessity: institutional access can be revoked for
-            # aggressive querying.
+            # Politeness delay before every request, including the first.
             time.sleep(self._delay)
 
             token = self._get_access_token()
@@ -296,8 +259,6 @@ class ResearchApiClient(TikTokClient):
                     timeout=60,
                 )
             except requests.RequestException as exc:
-                # Transient network problems (DNS blips, dropped connections)
-                # are worth retrying; record and continue.
                 last_error = f"network error: {exc}"
                 logger.warning("Attempt %d/%d failed: %s", attempt, self._max_retries, last_error)
                 self._backoff(attempt)
@@ -307,8 +268,7 @@ class ResearchApiClient(TikTokClient):
             if response.status_code == 200:
                 payload = response.json()
                 # TikTok returns HTTP 200 even for some application-level
-                # errors, signalling them in an `error` object instead. Missing
-                # that would mean silently recording zero results as success.
+                # errors, signalled in an `error` object instead.
                 error = payload.get("error", {})
                 if error and error.get("code") not in (None, "ok"):
                     raise TikTokClientError(
@@ -330,7 +290,7 @@ class ResearchApiClient(TikTokClient):
             # --- 401 Unauthorized: token may have been revoked early ------
             if response.status_code == 401:
                 logger.warning("Token rejected (HTTP 401); forcing a refresh.")
-                self._access_token = None      # discard the cached token
+                self._access_token = None
                 last_error = "unauthorized (HTTP 401)"
                 self._backoff(attempt)
                 continue
@@ -357,13 +317,7 @@ class ResearchApiClient(TikTokClient):
         )
 
     def _backoff(self, attempt: int) -> None:
-        """Sleep for an exponentially increasing interval between retries.
-
-        Waits 2, 4, 8, 16... seconds. Exponential backoff is the standard
-        response to rate limiting: retrying immediately would add load to a
-        service that has just told us it is overloaded, and would burn through
-        the retry budget in under a second.
-        """
+        """Sleep for an exponentially increasing interval between retries (2, 4, 8, 16... s)."""
         wait_seconds = 2 ** attempt
         logger.info("Backing off for %d seconds before retrying.", wait_seconds)
         time.sleep(wait_seconds)
@@ -379,41 +333,69 @@ class ResearchApiClient(TikTokClient):
         end_date: date,
         language: str,
         max_posts: int,
+        keywords: Optional[List[str]] = None,
+        random_order: bool = False,
     ) -> Iterator[Post]:
-        """Search videos by hashtag, date window and language.
+        """Search videos by hashtag (or keyword), date window and language.
 
-        Automatically splits the requested window into 30-day chunks (an API
-        limit) and paginates within each chunk until `max_posts` posts have
-        been yielded or the data runs out.
+        Splits the requested window into 30-day chunks (an API limit) and
+        paginates within each chunk - but only up to that chunk's fair
+        share of `max_posts`, not the whole budget. Without `random_order`,
+        TikTok returns results within a chunk in decreasing video-ID order -
+        effectively newest-first, since IDs are roughly chronological - so
+        without per-chunk budgeting a single busy chunk (e.g. the most
+        recent 30 days of a multi-month window) can consume the entire
+        budget before later chunks are ever queried, silently turning a
+        "search the whole window" request into "search the first chunk that
+        has enough volume." Each chunk's unfilled share rolls forward to the
+        remaining chunks, so a quiet chunk doesn't waste budget either.
+
+        `random_order=True` asks the API itself for a random sample instead
+        of ID order, which addresses the same clustering problem from a
+        different angle - worth verifying live whether it can still be
+        paginated with cursor/search_id the normal way, or whether it only
+        ever returns a single capped batch; TikTok's docs describe it as
+        returning "1-100 videos" without being explicit either way.
         """
         logger.info(
-            "Searching TikTok Research API: tags=%s window=%s..%s lang=%s target=%d",
-            hashtags, start_date, end_date, language, max_posts,
+            "Searching TikTok Research API: tags=%s keywords=%s window=%s..%s lang=%s "
+            "target=%d random_order=%s",
+            hashtags, keywords or [], start_date, end_date, language, max_posts, random_order,
         )
 
         yielded = 0
+        chunks = self._split_date_window(start_date, end_date)
 
-        for chunk_start, chunk_end in self._split_date_window(start_date, end_date):
+        for chunk_index, (chunk_start, chunk_end) in enumerate(chunks):
             if yielded >= max_posts:
                 break
 
-            logger.info("Querying window %s .. %s", chunk_start, chunk_end)
+            remaining_budget = max_posts - yielded
+            remaining_chunks = len(chunks) - chunk_index
+            # Ceiling division: any chunk that comes up short leaves its
+            # slack for the chunks after it, rather than being lost.
+            chunk_budget = -(-remaining_budget // remaining_chunks)
+            chunk_yielded = 0
 
-            # Cursor-based pagination state, reset for each new date window.
+            logger.info(
+                "Querying window %s .. %s (budget: %d of %d remaining)",
+                chunk_start, chunk_end, chunk_budget, remaining_budget,
+            )
+
             cursor: Optional[int] = None
             search_id: Optional[str] = None
 
-            while yielded < max_posts:
+            while chunk_yielded < chunk_budget and yielded < max_posts:
                 body = self._build_search_body(
                     hashtags=hashtags,
                     language=language,
                     start_date=chunk_start,
                     end_date=chunk_end,
-                    # Never request more than we still need, so the final page
-                    # is not needlessly large.
-                    page_size=min(_MAX_PAGE_SIZE, max_posts - yielded),
+                    page_size=min(_MAX_PAGE_SIZE, chunk_budget - chunk_yielded),
                     cursor=cursor,
                     search_id=search_id,
+                    keywords=keywords,
+                    random_order=random_order,
                 )
 
                 data = self._request(
@@ -428,19 +410,20 @@ class ResearchApiClient(TikTokClient):
                     break
 
                 for raw_video in videos:
-                    if yielded >= max_posts:
+                    if chunk_yielded >= chunk_budget or yielded >= max_posts:
                         break
                     post = self._parse_post(raw_video)
                     if post is not None:
                         yielded += 1
+                        chunk_yielded += 1
                         yield post
 
                 # `has_more` is the authoritative end-of-results signal.
                 if not data.get("has_more", False):
                     break
 
-                # Carry BOTH values forward: TikTok's pagination is stateful
-                # and rejects a cursor presented without its search_id.
+                # Both values must be carried forward: TikTok's pagination
+                # is stateful and rejects a cursor without its search_id.
                 cursor = data.get("cursor")
                 search_id = data.get("search_id")
 
@@ -449,21 +432,16 @@ class ResearchApiClient(TikTokClient):
     def _split_date_window(self, start: date, end: date) -> List[tuple]:
         """Split a date range into consecutive chunks of at most 30 days.
 
-        The API rejects any query spanning more than 30 days, but the study
-        window is four months. Splitting here means the rest of the codebase
-        can reason about the full study period and stay unaware of this limit.
-
         Returns:
-            A list of (chunk_start, chunk_end) date pairs covering [start, end]
-            exactly once, with no gaps and no overlaps. Overlaps would matter:
-            they would produce duplicate posts and inflate the sample.
+            A list of (chunk_start, chunk_end) pairs covering [start, end]
+            exactly once, with no gaps or overlaps (an overlap would
+            duplicate posts and inflate the sample).
         """
         chunks: List[tuple] = []
         cursor = start
 
         while cursor <= end:
-            # Subtract one day because both endpoints are inclusive: a window
-            # from the 1st to the 30th is 30 days, not 31.
+            # Both endpoints are inclusive: 1st to 30th is 30 days, not 31.
             chunk_end = min(cursor + timedelta(days=_MAX_QUERY_WINDOW_DAYS - 1), end)
             chunks.append((cursor, chunk_end))
             cursor = chunk_end + timedelta(days=1)
@@ -480,56 +458,62 @@ class ResearchApiClient(TikTokClient):
         page_size: int,
         cursor: Optional[int],
         search_id: Optional[str],
+        keywords: Optional[List[str]] = None,
+        random_order: bool = False,
     ) -> Dict[str, Any]:
         """Assemble the JSON body for one video-query request.
 
-        The API's query language is a boolean tree of conditions. We build:
+        With hashtags but no keywords, builds `hashtag_name IN [our tags]`;
+        within that condition the value list is an OR, so this asks for a
+        post carrying any of the study hashtags.
 
-            (hashtag IN [our tags])  AND  (language IN [en])
+        With keywords but no hashtags, builds `keyword IN [our terms]`
+        instead - a free-text match against the caption, closer to typing a
+        phrase into TikTok's own search bar than matching a formal hashtag.
 
-        Within a single condition the list of values is an OR, so this asks
-        for: a post carrying ANY of the study hashtags.
+        When both are given, the query widens to
+        `(hashtag_name IN [tags]) OR (keyword IN [terms])`, so a post
+        qualifies by carrying a study hashtag OR mentioning a study keyword
+        in its caption - this is deliberately a broadening OR, not a
+        narrowing AND, so it does not shrink the sample the way stacking two
+        AND conditions would. At least one of hashtags or keywords must be
+        non-empty; config.py enforces this at start-up.
 
-        WHY LANGUAGE IS NOT FILTERED HERE
-        ---------------------------------
         The `language` argument is accepted (to satisfy the shared client
-        interface) but deliberately NOT turned into a query condition.
-
-        The video-query endpoint accepts only the field names listed in
-        `_QUERYABLE_FIELDS`, and none of them describes language. Sending a
-        `video_language` condition - which an earlier version of this file did -
-        produces an opaque HTTP 400 on every single request.
-
-        Two alternatives were rejected:
-
-          * Filtering by `region_code` to English-speaking countries would be
-            a proxy, not a language filter, and a badly biased one for THIS
-            study: it would systematically exclude English-language posts from
-            Iran, Israel and the wider region, which are among the most
-            important cases in the sample.
-
-          * Dropping the language criterion entirely would change the study
-            design.
-
-        Instead, language is determined locally from the caption text after
-        retrieval (see `src/language.py`), which the pipeline applies as an
-        inclusion criterion. This costs API quota - non-English posts are
-        fetched and then discarded - which is accounted for in the quota
-        guidance in the README.
+        interface) but is not turned into a query condition: the endpoint
+        accepts only the fields in `_QUERYABLE_FIELDS`, and none describes
+        language. Sending a `video_language` condition produces an opaque
+        HTTP 400 on every request. Filtering by `region_code` was rejected
+        as a proxy - it would be badly biased for this study, excluding
+        English-language posts from Iran, Israel and the wider region.
+        Language is instead determined locally from the caption text after
+        retrieval; see `src/language.py`.
         """
-        conditions: List[Dict[str, Any]] = [
-            {
+        conditions: List[Dict[str, Any]] = []
+
+        if hashtags:
+            conditions.append({
                 "operation": "IN",
                 "field_name": "hashtag_name",
-                # The API expects bare tag names, without '#'. `config.py`
-                # already strips any hash the researcher typed.
+                # config.py already strips any '#' the researcher typed.
                 "field_values": hashtags,
-            }
-        ]
+            })
 
-        # Defensive guard: if a future edit adds a condition on a field the
-        # endpoint does not accept, fail here with a clear message rather than
-        # sending it and receiving an unexplained 400 from TikTok.
+        if keywords:
+            conditions.append({
+                "operation": "IN",
+                "field_name": "keyword",
+                "field_values": keywords,
+            })
+
+        if not conditions:
+            raise TikTokClientError(
+                "Cannot search: both hashtags and keywords are empty."
+            )
+
+        # Defensive guard: fail here with a clear message if a future edit
+        # adds a condition on a field the endpoint does not accept, rather
+        # than sending it and getting an unexplained 400 from TikTok.
         for condition in conditions:
             field_name = condition["field_name"]
             if field_name not in _QUERYABLE_FIELDS:
@@ -538,16 +522,27 @@ class ResearchApiClient(TikTokClient):
                     f"endpoint. Valid fields: {sorted(_QUERYABLE_FIELDS)}"
                 )
 
+        # A single condition is wrapped in "and" (harmless with only one
+        # member); two or more become "or" so hashtags and keywords widen
+        # the search instead of both being required at once.
+        combinator = "and" if len(conditions) == 1 else "or"
+
         body: Dict[str, Any] = {
-            "query": {"and": conditions},
+            "query": {combinator: conditions},
             # The API wants compact dates: "20260401", not "2026-04-01".
             "start_date": start_date.strftime("%Y%m%d"),
             "end_date": end_date.strftime("%Y%m%d"),
             "max_count": page_size,
         }
 
-        # Pagination fields are included only on follow-up requests. Sending a
-        # null cursor on the first request causes a 400.
+        # Only sent when true: omitting it entirely (rather than sending
+        # false) keeps the request identical to before this option existed
+        # for anyone not using it.
+        if random_order:
+            body["is_random"] = True
+
+        # Pagination fields only on follow-up requests: a null cursor on the
+        # first request causes a 400.
         if cursor is not None:
             body["cursor"] = cursor
         if search_id is not None:
@@ -558,9 +553,9 @@ class ResearchApiClient(TikTokClient):
     def _parse_post(self, raw: Dict[str, Any]) -> Optional[Post]:
         """Translate one raw API video object into a `Post`.
 
-        Returns None (rather than raising) when the record is unusable, so a
-        single malformed row cannot abort a multi-hour collection run. The
-        skip is logged so it remains visible and countable.
+        Returns None (rather than raising) when the record is unusable, so
+        a single malformed row cannot abort a multi-hour run. The skip is
+        logged so it stays visible and countable.
         """
         post_id = str(raw.get("id", "")).strip()
         if not post_id:
@@ -569,9 +564,14 @@ class ResearchApiClient(TikTokClient):
 
         username = str(raw.get("username", "")).strip()
 
-        # `hashtag_names` is absent (not empty) when a post has no hashtags,
-        # so a plain `raw["hashtag_names"]` would raise KeyError.
+        # hashtag_names is absent (not empty) when a post has no hashtags.
         hashtags = raw.get("hashtag_names") or []
+
+        # Logs the raw field exactly as TikTok sent it, before any parsing,
+        # so a run with LOG_LEVEL=DEBUG can confirm whether the API is
+        # returning video_tag data at all - not just what this code decided
+        # to do with it. See the README's note on verifying has_ai_label.
+        logger.debug("post %s raw video_tag: %r", post_id, raw.get("video_tag"))
 
         has_ai_label, ai_label_kind = self._extract_ai_label(raw)
 
@@ -582,8 +582,8 @@ class ResearchApiClient(TikTokClient):
             create_time=unix_to_iso(raw.get("create_time")),
             caption=str(raw.get("video_description", "") or ""),
             hashtags=[str(tag).lstrip("#") for tag in hashtags],
-            # The Research API does not return a canonical URL, so we build the
-            # standard public permalink from the two components it does return.
+            # The API does not return a canonical URL; build the standard
+            # public permalink from the two components it does return.
             video_url=f"https://www.tiktok.com/@{username}/video/{post_id}",
             has_ai_label=has_ai_label,
             ai_label_kind=ai_label_kind,
@@ -598,35 +598,24 @@ class ResearchApiClient(TikTokClient):
     def _extract_ai_label(raw: Dict[str, Any]) -> tuple:
         """Determine whether, and how, TikTok labelled this post as AI content.
 
-        This method produces the study's key dependent variable, so it is worth
-        understanding precisely.
-
-        THE SOURCE FIELD
-        ----------------
-        The Research API exposes content labels through `video_tag`, a struct
-        (or list of structs) of the form:
+        This produces the study's key dependent variable. The Research API
+        exposes content labels through `video_tag`, a struct (or list of
+        structs):
 
             {"type": "AIGC",    "number": 1}   Creator Labelled as AI-Generated
             {"type": "AIGC",    "number": 2}   AI-Generated
             {"type": "Branded", "number": 1}   Paid Partnership
             {"type": "Branded", "number": 7}   Creator Earns Commission
 
-        Only the AIGC type concerns this study; Branded tags are commercial
-        disclosures and are ignored.
+        Only AIGC concerns this study; Branded tags are commercial
+        disclosures and are ignored. The two AIGC values are kept separate:
+        number=1 is the creator's own voluntary disclosure (creator
+        behaviour); number=2 is applied by TikTok itself, typically from
+        C2PA content credentials (provenance). Both set `has_ai_label`.
 
-        WHY THE TWO AIGC VALUES ARE KEPT SEPARATE
-        -----------------------------------------
-        number=1 is the creator's own voluntary disclosure - a measure of
-        creator behaviour. number=2 is applied by TikTok, typically from C2PA
-        content credentials embedded by the generating tool - a measure of
-        provenance metadata. They answer different research questions, and
-        collapsing them into one boolean at collection time discards the
-        distinction permanently. Both are returned; `has_ai_label` is True for
-        either.
-
-        The implementation tolerates `video_tag` arriving as a single object, a
-        list of objects, or being absent entirely, because the API is
-        documented loosely on this point and the shape has changed before.
+        `video_tag` is tolerated as a single object, a list of objects, or
+        absent entirely, since the API's documentation is loose on this
+        point and the shape has changed before.
 
         Returns:
             A tuple of (has_ai_label, ai_label_kind), where ai_label_kind is
@@ -634,12 +623,9 @@ class ResearchApiClient(TikTokClient):
         """
         video_tag = raw.get("video_tag")
         if not video_tag:
-            # No tags at all. Note the ambiguity this leaves: the absence of a
-            # label is not evidence that the content is authentic.
+            # Absence of a label is not evidence the content is authentic.
             return False, ""
 
-        # Normalise to a list so a single struct and a list of structs are
-        # handled by exactly the same code below.
         tags = video_tag if isinstance(video_tag, list) else [video_tag]
 
         found_creator_labelled = False
@@ -649,10 +635,9 @@ class ResearchApiClient(TikTokClient):
             if not isinstance(tag, dict):
                 continue
 
-            # Compare case-insensitively: the documentation writes "AIGC", but
-            # relying on exact casing for the study's key variable would be
-            # fragile.
-            if str(tag.get("type", "")).strip().upper() != "AIGC":
+            # Live responses have been observed sending "AIGC Type", not the
+            # bare "AIGC" the docs show - match on prefix so both are caught.
+            if not str(tag.get("type", "")).strip().upper().startswith("AIGC"):
                 continue  # a Branded tag or something unrecognised
 
             try:
@@ -671,9 +656,8 @@ class ResearchApiClient(TikTokClient):
             elif number == 2:
                 found_ai_generated = True
             else:
-                # An AIGC tag with an unexpected number still means an AI label
-                # is present. Log it so a new value TikTok introduces is
-                # noticed rather than silently mapped to "no label".
+                # A new AIGC number should be noticed, not mapped silently
+                # to "no label".
                 logger.warning(
                     "Unrecognised AIGC video_tag number %d on post %s. "
                     "Recording it as AI-labelled; check the API docs for a "
@@ -682,8 +666,8 @@ class ResearchApiClient(TikTokClient):
                 found_ai_generated = True
 
         if found_ai_generated:
-            # Platform-applied detection takes precedence when both are present,
-            # because it is the stronger evidence of provenance.
+            # Platform-applied detection takes precedence as the stronger
+            # evidence of provenance.
             return True, "ai_generated"
         if found_creator_labelled:
             return True, "creator_labelled"
@@ -696,7 +680,7 @@ class ResearchApiClient(TikTokClient):
     def fetch_comments(self, post_id: str, max_comments: int) -> Iterator[Comment]:
         """Yield up to `max_comments` comments for one video.
 
-        Pagination here is simple offset-based cursoring: each response reports
+        Pagination is simple offset-based cursoring: each response reports
         how many records remain, and the next request supplies the running
         offset.
         """
@@ -719,9 +703,8 @@ class ResearchApiClient(TikTokClient):
                     body=body,
                 )
             except TikTokClientError as exc:
-                # A post with comments disabled, or one deleted between the
-                # search and this call, is a NORMAL observation - not a reason
-                # to abort the run. Log it and move on with zero comments.
+                # A post with comments disabled, or deleted between the
+                # search and this call, is a normal observation.
                 logger.warning(
                     "Could not fetch comments for post %s (%s). "
                     "Recording it with zero comments.",
@@ -757,8 +740,8 @@ class ResearchApiClient(TikTokClient):
 
         return Comment(
             comment_id=comment_id,
-            # Prefer the API's own video_id, but fall back to the post we
-            # asked about, so the foreign key is never left empty.
+            # Prefer the API's own video_id, falling back to the post asked
+            # about so the foreign key is never empty.
             post_id=str(raw.get("video_id", "") or post_id),
             comment_text=str(raw.get("text", "") or ""),
             create_time=unix_to_iso(raw.get("create_time")),
@@ -768,23 +751,9 @@ class ResearchApiClient(TikTokClient):
         )
 
     # -----------------------------------------------------------------
-    # Interface method 3 and cleanup
     # -----------------------------------------------------------------
-
-    def resolve_video_download_url(self, post: Post) -> Optional[str]:
-        """Return None: the Research API does not supply direct media URLs.
-
-        See `base.TikTokClient.resolve_video_download_url` for the full
-        explanation. In short: the Research API returns metadata only, and
-        fetching from TikTok's media CDN is restricted by the Terms of Service.
-        Confirm which media-access route your institution's agreement permits,
-        then implement that route here.
-        """
-        logger.debug(
-            "No media URL available for post %s - the Research API returns "
-            "metadata only.", post.post_id,
-        )
-        return None
+    # Cleanup
+    # -----------------------------------------------------------------
 
     def close(self) -> None:
         """Close the HTTP session and release its connection pool."""

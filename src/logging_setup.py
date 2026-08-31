@@ -1,23 +1,11 @@
 """
 Logging configuration.
 
-WHY A DEDICATED MODULE FOR SOMETHING SO SMALL?
-----------------------------------------------
-Research data collection is a long-running, unattended process. When a run of
-several hours produces a dataset, the accompanying log file is the only
-evidence of HOW that dataset came to be: which parameters were used, which
-requests failed, which posts were skipped and why.
-
-Using `print()` would send that evidence to a terminal window that closes.
-Configuring logging properly gives the project:
-
-  * a permanent, timestamped record on disk, one file per run;
-  * simultaneous human-readable output on screen while the run is in progress;
-  * a single switch (LOG_LEVEL in .env) to make the output more or less
-    verbose without editing any code.
-
-The log file is written next to the data, so a dataset and its provenance
-record travel together to the college server.
+Configures one timestamped log file per run plus live console output, so a
+long unattended collection run leaves a permanent, human-readable record of
+which parameters were used, which requests failed, and which posts were
+skipped and why. The log file is written next to the data, so a dataset and
+its provenance record travel together.
 """
 
 from __future__ import annotations
@@ -31,63 +19,65 @@ from pathlib import Path
 def setup_logging(logs_dir: Path, level: str = "INFO") -> Path:
     """Configure logging for the whole application.
 
-    Called exactly once, from the entry point, before any other work begins.
-    Every other module then simply calls `logging.getLogger(__name__)` and
-    inherits this configuration - they never configure logging themselves.
+    Called once, from the entry point, before any other work begins. Every
+    other module then just calls `logging.getLogger(__name__)` and inherits
+    this configuration.
 
     Args:
         logs_dir: Directory in which to create the log file. Created if absent.
         level:    Minimum severity to record: DEBUG, INFO, WARNING or ERROR.
 
     Returns:
-        The path of the log file that was created, so the caller can tell the
-        user where to look.
+        The path of the log file that was created.
     """
     logs_dir.mkdir(parents=True, exist_ok=True)
 
-    # One log file per run, named by start time. Keeping runs in separate files
-    # (rather than appending to one growing file) means a pilot run and the
-    # full collection run can never be confused with each other.
+    # One log file per run, named by start time, so separate runs are never
+    # confused with each other.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = logs_dir / f"collection_{timestamp}.log"
 
-    # Translate the text level from .env into the logging module's constant.
-    # An unrecognised value falls back to INFO rather than crashing, because a
-    # typo in a logging setting should never abort a data collection run.
+    # An unrecognised level falls back to INFO rather than crashing.
     numeric_level = getattr(logging, level.upper(), logging.INFO)
 
-    # The format includes the module name so that, when something goes wrong,
-    # the log line says WHICH part of the pipeline produced it.
     log_format = "%(asctime)s | %(levelname)-8s | %(name)-22s | %(message)s"
     date_format = "%Y-%m-%d %H:%M:%S"
     formatter = logging.Formatter(log_format, datefmt=date_format)
 
-    # Handler 1: the permanent file record.
-    # encoding="utf-8" is essential - captions and comments in this study
-    # contain Arabic, Hebrew, Persian and emoji, none of which survive the
-    # default Windows encoding (cp1252) without raising UnicodeEncodeError.
+    # encoding="utf-8" is required: captions and comments contain Arabic,
+    # Hebrew, Persian and emoji, which the default Windows encoding does not
+    # support.
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
 
-    # Handler 2: live progress on the terminal, so the operator can see that a
-    # long run is still making progress.
+    # Windows' console defaults to a legacy codepage (e.g. cp1252) that
+    # cannot encode most emoji or Arabic/Hebrew/Persian text - both of which
+    # appear routinely in this study's captions, hashtags and comments, and
+    # now even in a search hashtag (#iran🇮🇷). Without this, printing such a
+    # line raises UnicodeEncodeError from inside the logging module itself,
+    # silently dropping that log line instead of crashing the run.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+    except (AttributeError, ValueError):
+        # Not every stream supports reconfigure (e.g. some redirected/piped
+        # stdout); falling back to whatever encoding it already has is
+        # better than failing logging setup entirely.
+        pass
+
     console_handler = logging.StreamHandler(stream=sys.stdout)
     console_handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
     root_logger.setLevel(numeric_level)
 
-    # Remove any handlers already attached. Without this, running the pipeline
-    # twice in the same Python process (as the test suite does) would attach a
-    # second set of handlers and print every line twice.
+    # Clear any existing handlers so re-running in the same process (as the
+    # test suite does) doesn't duplicate every log line.
     root_logger.handlers.clear()
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
-    # The `requests` library logs every connection at DEBUG level through
-    # urllib3. That is far too noisy to leave on, so it is pinned to WARNING
-    # regardless of our own level - we keep OUR debug output without drowning
-    # in the HTTP library's internals.
+    # `requests` logs every connection at DEBUG via urllib3; pin it to
+    # WARNING so it doesn't drown out our own debug output.
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     return log_path

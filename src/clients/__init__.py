@@ -1,13 +1,9 @@
 """
 Client package - and the factory that chooses between implementations.
 
-This package contains every piece of code that knows how to obtain TikTok
-data. The `build_client` factory below is the single place where the choice
-between the mock and the live API is made, driven entirely by configuration.
-
-Nothing else in the project imports a concrete client class. The pipeline asks
-the factory for "a client" and receives whichever one the .env file selected,
-which is what makes the mock-to-production switch a one-line change.
+`build_client` below is the single place where the choice between the mock
+and the live API is made, driven by configuration. Nothing else in the
+project imports a concrete client class.
 """
 
 from __future__ import annotations
@@ -43,12 +39,10 @@ def build_client(settings: Settings) -> TikTokClient:
         A ready-to-use object satisfying the `TikTokClient` interface.
 
     Raises:
-        ConfigError: Never raised here - `Settings.__post_init__` has already
-                     rejected any unknown client type, so by the time this
-                     function runs the value is guaranteed valid. The final
-                     `raise` below is therefore unreachable defensive code,
-                     kept so that adding a third client type without updating
-                     this function fails loudly rather than silently.
+        ValueError: Unreachable in practice - `Settings.__post_init__`
+                    already rejects any unknown client type. Kept so that
+                    adding a third client type without updating this
+                    function fails loudly rather than silently.
     """
     if settings.client_type == "mock":
         logger.warning(

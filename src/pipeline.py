@@ -1,48 +1,34 @@
 """
 The collection pipeline: the orchestrator that ties every component together.
 
-WHAT THIS MODULE DOES - AND DELIBERATELY DOES NOT DO
-----------------------------------------------------
-This module contains the study's PROCEDURE and nothing else. It decides the
-order of operations, what counts as a usable post, and when to stop. It
-contains no HTTP code, no CSV escaping, no file I/O details - those live in
-`clients/`, `storage.py` and `downloader.py` respectively.
+`pipeline.py` contains the study's procedure - the order of operations, what
+counts as a usable post, and when to stop - and nothing else. HTTP code and
+CSV escaping live in `clients/` and `storage.py`.
 
-Keeping the procedure separate from the mechanics is what allows a reviewer to
-read this one file and understand exactly what the study did, without needing
-to follow any networking or file-format code.
-
-THE PROCEDURE, IN ORDER
------------------------
+Procedure, in order:
     1. Open both CSV files, learning which records were already collected.
     2. Ask the client for posts matching the hashtags, dates and language.
-    3. For each post:
-         a. skip it if it is already in raw_posts.csv (resumable runs);
-         b. verify it genuinely matches the study criteria (see _is_eligible);
-         c. download the video, if the source can supply one;
-         d. write the post row;
-         e. fetch its comments, up to the cap, and write those rows.
+    3. For each post: skip if already collected, check eligibility, write
+       the post row, then fetch and write its comments.
     4. Stop when the target sample size is reached or the results run out.
     5. Transfer the finished dataset to the server, if configured.
 
-WHY POSTS ARE WRITTEN BEFORE THEIR COMMENTS
--------------------------------------------
-`raw_comments.csv` references `raw_posts.csv` by post_id. Writing the post
-first means the referenced row always exists on disk before anything points at
-it, so an interrupted run can never leave orphan comments - comments whose
-parent post was never saved.
+Posts are written before their comments, so `raw_comments.csv` (which
+references posts by post_id) never ends up pointing at a row that was never
+saved.
 """
 
 from __future__ import annotations
 
+import csv
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from .clients import TikTokClient, TikTokClientError, build_client
 from .config import Settings
-from .downloader import VideoDownloader
 from .language import LanguageFilter
 from .models import Post
 from .storage import open_comments_writer, open_posts_writer
@@ -53,13 +39,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CollectionStats:
-    """Counters describing what one collection run actually did.
-
-    These are not decoration. A methods section must be able to state how many
-    posts were examined, how many were excluded and why, and how many comments
-    were captured. Counting during the run is the only reliable way to report
-    that accurately afterwards.
-    """
+    """Counters describing what one collection run actually did."""
 
     posts_seen: int = 0
     """Posts returned by the data source, before any filtering."""
@@ -76,8 +56,11 @@ class CollectionStats:
     comments_saved: int = 0
     """Comment rows newly written during this run."""
 
-    videos_downloaded: int = 0
-    """Video files newly saved to disk."""
+    posts_skipped_lower_rank: int = 0
+    """Eligible posts that lost out to higher-view_count posts (sort_by=view_count only)."""
+
+    posts_skipped_account_cap: int = 0
+    """Eligible posts skipped because their account already hit STUDY_MAX_POSTS_PER_ACCOUNT."""
 
     errors: int = 0
     """Non-fatal errors that caused one post to be abandoned."""
@@ -97,8 +80,9 @@ class CollectionStats:
             f"  Posts saved (new)         : {self.posts_saved}\n"
             f"  Posts skipped (duplicate) : {self.posts_skipped_duplicate}\n"
             f"  Posts skipped (ineligible): {self.posts_skipped_ineligible}\n"
+            f"  Posts skipped (lower rank): {self.posts_skipped_lower_rank}\n"
+            f"  Posts skipped (account cap): {self.posts_skipped_account_cap}\n"
             f"  Comments saved (new)      : {self.comments_saved}\n"
-            f"  Videos downloaded         : {self.videos_downloaded}\n"
             f"  Non-fatal errors          : {self.errors}\n"
             "========================================================="
         )
@@ -112,71 +96,74 @@ class CollectionPipeline:
 
         Args:
             settings: The validated configuration.
-            client:   An optional pre-built client. Production code leaves this
-                      as None and lets the factory decide from the config; the
-                      test suite injects a controlled fake here. This is
-                      dependency injection, and it is the reason the pipeline
-                      can be tested without any network access at all.
+            client:   An optional pre-built client. Production code leaves
+                      this as None and lets the factory decide from the
+                      config; tests inject a controlled fake here.
         """
         self.settings = settings
         self.client = client if client is not None else build_client(settings)
         self.stats = CollectionStats()
 
-        # The English-only criterion is enforced locally, because the Research
-        # API has no server-side language filter. See src/language.py for the
-        # full reasoning and its methodological consequences.
+        # The language criterion is enforced locally: the Research API
+        # has no server-side language filter. See src/language.py.
         self.language_filter = LanguageFilter(
-            target_language=settings.language,
+            target_languages=settings.languages,
             mode=settings.language_mode,
         )
 
-    def run(self) -> CollectionStats:
-        """Execute the full collection procedure and return its statistics.
+        # Posts saved so far this username has, including prior runs -
+        # populated from disk in `run()` once STUDY_MAX_POSTS_PER_ACCOUNT is
+        # known to be in use. Keyed by username.
+        self._account_counts: Dict[str, int] = {}
 
-        Returns:
-            A `CollectionStats` object describing what happened.
-        """
+    def _load_account_counts(self, posts_csv: Path) -> Dict[str, int]:
+        """Count existing posts per username, so the cap holds across resumed runs."""
+        counts: Dict[str, int] = {}
+        if not posts_csv.exists() or posts_csv.stat().st_size == 0:
+            return counts
+
+        with open(posts_csv, newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                username = row.get("username", "").strip()
+                if username:
+                    counts[username] = counts.get(username, 0) + 1
+        return counts
+
+    def _account_at_cap(self, username: str) -> bool:
+        """True if `username` already has STUDY_MAX_POSTS_PER_ACCOUNT posts."""
+        cap = self.settings.max_posts_per_account
+        if cap <= 0:
+            return False
+        return self._account_counts.get(username, 0) >= cap
+
+    def run(self) -> CollectionStats:
+        """Execute the full collection procedure and return its statistics."""
         settings = self.settings
         settings.ensure_directories()
 
         logger.info(settings.describe())
         logger.info("Starting collection.")
 
-        # All three resources are opened in one nested `with` block so that
-        # every file handle and network session is closed exactly once, no
-        # matter how the run ends - normally, by exception, or by Ctrl-C.
-        with open_posts_writer(settings.posts_csv) as posts_writer, \
-             open_comments_writer(settings.comments_csv) as comments_writer, \
-             VideoDownloader(
-                 videos_dir=settings.videos_dir,
-                 project_root=settings.output_root,
-                 max_retries=settings.max_retries,
-             ) as downloader:
+        if settings.max_posts_per_account > 0:
+            self._account_counts = self._load_account_counts(settings.posts_csv)
 
-            # If the sample is already complete, do not contact the API at all.
-            # Without this check a finished collection would still spend quota
-            # re-searching, only to discard every result as a duplicate.
+        with open_posts_writer(settings.posts_csv) as posts_writer, \
+             open_comments_writer(settings.comments_csv) as comments_writer:
+
+            # If the sample is already complete, skip the API entirely.
             if posts_writer.total_records >= settings.max_posts:
                 logger.info(
                     "Sample is already complete: %d posts on disk, target is %d. "
                     "Nothing to collect. Raise STUDY_MAX_POSTS to extend it.",
                     posts_writer.total_records, settings.max_posts,
                 )
-                self.stats.videos_downloaded = downloader.downloaded_count
                 logger.info(self.stats.summary())
                 return self.stats
 
             try:
-                # Ask the data source for MORE posts than the target sample
-                # size, because some of what it returns will be filtered out
-                # locally - most often by the language criterion, which cannot
-                # be applied server-side (see src/language.py).
-                #
-                # Without this over-fetch, requesting 20 posts and rejecting 3
-                # as non-English yields a sample of 17, silently undershooting
-                # the study design. The pipeline still stops the moment
-                # `max_posts` ELIGIBLE posts have been saved, so the extra
-                # budget is an upper bound, not a fixed cost.
+                # Over-fetch, because local filtering (mainly language) drops
+                # some results. The loop still stops the moment `max_posts`
+                # eligible posts have been saved, so this is an upper bound.
                 search_budget = settings.max_posts * settings.search_overfetch_factor
                 logger.info(
                     "Requesting up to %d posts to reach a target sample of %d "
@@ -187,82 +174,35 @@ class CollectionPipeline:
                     hashtags=settings.hashtags,
                     start_date=settings.start_date,
                     end_date=settings.end_date,
-                    language=settings.language,
+                    language=", ".join(settings.languages),
                     max_posts=search_budget,
+                    keywords=settings.keywords,
+                    random_order=settings.random_order,
                 )
 
-                for post in post_stream:
-                    self.stats.posts_seen += 1
-
-                    # --- Step 3a: already collected? ----------------------
-                    # Checked before any expensive work, so resuming a run does
-                    # not re-download videos or re-fetch comment threads.
-                    if posts_writer.already_have(post.post_id):
-                        self.stats.posts_skipped_duplicate += 1
-                        logger.debug("Post %s already collected; skipping.", post.post_id)
-                        continue
-
-                    # --- Step 3b: does it meet the study criteria? --------
-                    if not self._is_eligible(post):
-                        self.stats.posts_skipped_ineligible += 1
-                        continue
-
-                    try:
-                        self._process_post(post, posts_writer, comments_writer, downloader)
-                    except TikTokClientError as exc:
-                        # One post failing (deleted mid-run, comments locked,
-                        # a transient API fault) must not end the collection.
-                        # Count it, log it, continue with the next post.
-                        self.stats.errors += 1
-                        logger.error("Abandoning post %s: %s", post.post_id, exc)
-                        continue
-
-                    # --- Step 4: reached the target sample size? ----------
-                    # Measured against the TOTAL number of posts in the
-                    # dataset, not just those added during this run. Counting
-                    # only this run's additions would mean re-running a
-                    # completed collection appends another full sample, growing
-                    # the dataset past the size the study design specifies.
-                    if posts_writer.total_records >= settings.max_posts:
-                        logger.info(
-                            "Target sample size of %d posts reached "
-                            "(%d already present, %d added this run).",
-                            settings.max_posts,
-                            posts_writer.total_records - self.stats.posts_saved,
-                            self.stats.posts_saved,
-                        )
-                        break
+                if settings.sort_by == "view_count":
+                    self._run_ranked(post_stream, posts_writer, comments_writer)
+                else:
+                    self._run_streaming(post_stream, posts_writer, comments_writer)
 
             except TikTokClientError as exc:
-                # An error raised by the SEARCH itself (bad credentials,
-                # exhausted quota) is fatal: there is no next post to move on
-                # to. Everything already written stays on disk and valid.
+                # An error from the search itself is fatal: there is no next
+                # post to move on to. Everything already written stays valid.
                 logger.error("Collection stopped early: %s", exc)
                 self.stats.errors += 1
 
             except KeyboardInterrupt:
-                # Ctrl-C is a legitimate way to stop a long run. Because every
-                # row was flushed as it was written, the partial dataset on
-                # disk is complete and consistent up to this point, and a later
-                # run will resume from exactly here.
                 logger.warning("Interrupted by user. Partial data has been saved.")
 
-            self.stats.videos_downloaded = downloader.downloaded_count
-            logger.info(downloader.summary())
             logger.info(self.language_filter.summary())
 
         logger.info(self.stats.summary())
 
-        # --- Step 5: deliver to the server --------------------------------
-        # Runs after the `with` block, so every file is closed and flushed
-        # before anything tries to copy it - copying an open, half-flushed CSV
-        # would put a truncated file on the server.
+        # Transfer runs after the `with` block so every file is closed and
+        # flushed before anything tries to copy it.
         try:
             transfer_dataset(settings)
         except TransferError as exc:
-            # The data is safely on the local disk; only delivery failed. That
-            # is worth an error in the log, but it must not be reported as a
-            # failed collection, and it must not delete anything.
             logger.error(
                 "Collection succeeded but the server transfer failed: %s "
                 "The local dataset at %s is complete and the transfer can be "
@@ -271,42 +211,191 @@ class CollectionPipeline:
 
         return self.stats
 
+    def _run_streaming(self, post_stream, posts_writer, comments_writer) -> None:
+        """Save eligible posts in the order the source returns them.
+
+        Stops the moment the target sample size is reached, so this is
+        the cheapest strategy - it never scans further than it has to.
+        """
+        settings = self.settings
+
+        for post in post_stream:
+            self.stats.posts_seen += 1
+
+            # --- Step 3a: already collected? ----------------------
+            if posts_writer.already_have(post.post_id):
+                self.stats.posts_skipped_duplicate += 1
+                logger.debug("Post %s already collected; skipping.", post.post_id)
+                continue
+
+            # --- Step 3b: does it meet the study criteria? --------
+            if not self._is_eligible(post):
+                self.stats.posts_skipped_ineligible += 1
+                continue
+
+            # --- Step 3c: has this account already hit its cap? ---
+            if self._account_at_cap(post.username):
+                self.stats.posts_skipped_account_cap += 1
+                logger.debug(
+                    "Post %s skipped: @%s already has %d post(s), at the "
+                    "cap of %d.", post.post_id, post.username,
+                    self._account_counts.get(post.username, 0),
+                    settings.max_posts_per_account,
+                )
+                continue
+
+            try:
+                self._process_post(post, posts_writer, comments_writer)
+            except TikTokClientError as exc:
+                # One post failing must not end the collection.
+                self.stats.errors += 1
+                logger.error("Abandoning post %s: %s", post.post_id, exc)
+                continue
+
+            self._account_counts[post.username] = (
+                self._account_counts.get(post.username, 0) + 1
+            )
+
+            # --- Step 4: reached the target sample size? ----------
+            # Measured against the total dataset, not just this run's
+            # additions, so re-running a completed collection never
+            # grows the dataset past the configured size.
+            if posts_writer.total_records >= settings.max_posts:
+                logger.info(
+                    "Target sample size of %d posts reached "
+                    "(%d already present, %d added this run).",
+                    settings.max_posts,
+                    posts_writer.total_records - self.stats.posts_saved,
+                    self.stats.posts_saved,
+                )
+                break
+
+    def _run_ranked(self, post_stream, posts_writer, comments_writer) -> None:
+        """Scan the full search budget, then save the highest-view_count posts.
+
+        Unlike `_run_streaming`, this cannot stop early: the most-viral post
+        might be the last one the source returns, so every eligible new post
+        must be buffered and ranked before anything is written.
+        """
+        settings = self.settings
+        candidates = []
+
+        for post in post_stream:
+            self.stats.posts_seen += 1
+
+            if posts_writer.already_have(post.post_id):
+                self.stats.posts_skipped_duplicate += 1
+                logger.debug("Post %s already collected; skipping.", post.post_id)
+                continue
+
+            if not self._is_eligible(post):
+                self.stats.posts_skipped_ineligible += 1
+                continue
+
+            candidates.append(post)
+
+        candidates.sort(key=self._rank_score, reverse=True)
+
+        needed = max(0, settings.max_posts - posts_writer.total_records)
+        logger.info(
+            "Ranking %d eligible candidate(s) by view_count; keeping the top %d.",
+            len(candidates), needed,
+        )
+
+        # Walk the ranking highest-first, skipping (not stopping for) any
+        # candidate whose account is already at cap - a capped account must
+        # not block a lower-ranked candidate from a different one filling
+        # the slot instead.
+        selected: List[Post] = []
+        cap_skipped = 0
+        for post in candidates:
+            if len(selected) >= needed:
+                break
+            if self._account_at_cap(post.username):
+                cap_skipped += 1
+                continue
+            selected.append(post)
+            self._account_counts[post.username] = (
+                self._account_counts.get(post.username, 0) + 1
+            )
+
+        for post in selected:
+            try:
+                self._process_post(post, posts_writer, comments_writer)
+            except TikTokClientError as exc:
+                self.stats.errors += 1
+                logger.error("Abandoning post %s: %s", post.post_id, exc)
+                continue
+
+        self.stats.posts_skipped_account_cap += cap_skipped
+        self.stats.posts_skipped_lower_rank += max(
+            0, len(candidates) - len(selected) - cap_skipped
+        )
+
+        logger.info(
+            "Collected %d new post(s) by view_count; dataset now has %d of target %d.",
+            self.stats.posts_saved,
+            posts_writer.total_records,
+            settings.max_posts,
+        )
+
+    def _rank_score(self, post: Post) -> float:
+        """Score used to rank candidates when sort_by=view_count.
+
+        Plain view_count, multiplied by boost_multiplier when the post
+        carries one of the configured boost_hashtags (e.g. #fyp, #trending -
+        tags that don't qualify a post on their own, see _is_eligible, but
+        that creators use alongside a real topic tag to chase reach). A
+        multiplier rather than a hard tie-break so a handful of boost-tagged
+        views can't outrank a genuinely massive post with none.
+        """
+        if not self.settings.boost_hashtags:
+            return post.view_count
+
+        boost_tags_lower = {tag.lower() for tag in self.settings.boost_hashtags}
+        post_tags_lower = {tag.lower() for tag in post.hashtags}
+        if boost_tags_lower & post_tags_lower:
+            return post.view_count * self.settings.boost_multiplier
+        return post.view_count
+
     def _is_eligible(self, post: Post) -> bool:
         """Decide whether `post` belongs in the study sample.
 
         The data source is asked to filter server-side, but this second check
-        runs locally as well, for two reasons:
-
-          * the mock client does no filtering at all, so without this the mock
-            would not exercise the same code path as production;
-          * server-side filters are best-effort. TikTok's language detection
-            in particular is imperfect, and a post can be returned that carries
-            none of the requested hashtags in its final metadata.
-
-        Every exclusion is logged at DEBUG level, so the reason any particular
-        post is absent from the dataset can always be reconstructed from the
-        log - which is exactly what a reviewer asking "why is post X missing?"
-        needs.
+        runs locally too: the mock client does no filtering at all, and
+        server-side filters are best-effort (a post can be returned without
+        the requested hashtags in its final metadata). Every exclusion is
+        logged at DEBUG level so it can be reconstructed later.
 
         Returns:
             True if the post should be collected.
         """
-        # Criterion 1: it must carry at least one of the study's hashtags.
-        # Comparison is case-insensitive because TikTok preserves the author's
-        # capitalisation: #IsraelIran, #israeliran and #ISRAELIRAN are one tag.
+        # Criterion 1: at least one study hashtag, OR (when keywords are
+        # configured) a study keyword in the caption - matched
+        # case-insensitively either way. This must mirror the OR the search
+        # query itself uses (see research_client._build_search_body): a post
+        # that only matched via keyword would otherwise be wrongly rejected
+        # here for "carrying none of the study hashtags".
         study_tags_lower = {tag.lower() for tag in self.settings.hashtags}
         post_tags_lower = {tag.lower() for tag in post.hashtags}
+        hashtag_match = bool(study_tags_lower & post_tags_lower)
 
-        if not (study_tags_lower & post_tags_lower):
+        keyword_match = False
+        if self.settings.keywords:
+            caption_lower = post.caption.lower()
+            keyword_match = any(
+                kw.lower() in caption_lower for kw in self.settings.keywords
+            )
+
+        if not (hashtag_match or keyword_match):
             logger.debug(
-                "Excluding post %s: carries none of the study hashtags (has: %s).",
+                "Excluding post %s: carries none of the study hashtags and "
+                "matches none of the study keywords (hashtags: %s).",
                 post.post_id, post.hashtags,
             )
             return False
 
-        # Criterion 2: the caption must be in the study's target language.
-        # Checked here rather than at the API because the video-query endpoint
-        # offers no language filter (see src/language.py).
+        # Criterion 2: caption must be in the study's target language.
         keep, reason = self.language_filter.matches(post.caption)
         if not keep:
             logger.debug(
@@ -314,16 +403,41 @@ class CollectionPipeline:
             )
             return False
 
-        # Criterion 3: it must have a usable identifier. A post without an ID
-        # cannot be joined to its comments or its video file, so it is
-        # unusable regardless of its content.
+        # Criterion 3: must have a usable identifier.
         if not post.post_id:
             logger.debug("Excluding a post with no post_id.")
             return False
 
-        # Criterion 4: it must fall inside the study window. The API is asked
-        # for this range, but the check is repeated because an off-by-one in a
-        # date boundary is both easy to make and very hard to notice later.
+        # Criterion 4: must meet the minimum engagement threshold.
+        if post.comment_count < self.settings.min_comments:
+            logger.debug(
+                "Excluding post %s: comment_count %d is below the minimum of %d.",
+                post.post_id, post.comment_count, self.settings.min_comments,
+            )
+            return False
+
+        # Criterion 4b: must carry an AI content label, if required.
+        if self.settings.require_ai_label and not post.has_ai_label:
+            logger.debug(
+                "Excluding post %s: no AI content label, and "
+                "STUDY_REQUIRE_AI_LABEL is on.", post.post_id,
+            )
+            return False
+
+        # Criterion 4c: author_region must be in the allowed set, if restricted.
+        # Compared case-insensitively - TikTok returns region codes in mixed
+        # case ("US" vs "us") depending on the post, not consistently.
+        if self.settings.require_regions and (
+            post.author_region or ""
+        ).upper() not in self.settings.require_regions:
+            logger.debug(
+                "Excluding post %s: region %r not in %s.",
+                post.post_id, post.author_region, self.settings.require_regions,
+            )
+            return False
+
+        # Criterion 5: must fall inside the study window (rechecked locally
+        # even though the API is asked for this range).
         if post.create_time:
             try:
                 created = datetime.fromisoformat(post.create_time).date()
@@ -335,8 +449,8 @@ class CollectionPipeline:
                     )
                     return False
             except ValueError:
-                # An unparseable timestamp is suspicious but not disqualifying;
-                # the post is kept and the anomaly recorded for review.
+                # An unparseable timestamp is kept rather than excluded, and
+                # the anomaly is recorded for review.
                 logger.debug(
                     "Post %s has an unparseable create_time (%r); keeping it.",
                     post.post_id, post.create_time,
@@ -349,26 +463,11 @@ class CollectionPipeline:
         post: Post,
         posts_writer,
         comments_writer,
-        downloader: VideoDownloader,
     ) -> None:
-        """Collect one eligible post completely: video, metadata, comments."""
+        """Collect one eligible post completely: metadata, then comments."""
         settings = self.settings
 
-        # --- Step 3c: the video file --------------------------------------
-        if settings.download_videos:
-            # The client decides whether a downloadable URL exists; the
-            # downloader decides what to do about it. Neither knows about the
-            # other's constraints, which is why the media-access policy can
-            # change without touching this line.
-            media_url = self.client.resolve_video_download_url(post)
-            post.video_path = downloader.download(post, media_url)
-        else:
-            logger.debug("DOWNLOAD_VIDEOS is false; skipping media for %s.", post.post_id)
-            post.video_path = ""
-
-        # --- Step 3d: the metadata row ------------------------------------
-        # Written BEFORE the comments so that the row a comment points at
-        # always exists on disk first.
+        # --- Step 3c: the metadata row ------------------------------------
         if posts_writer.write_row(post.to_csv_row()):
             self.stats.posts_saved += 1
             logger.info(
@@ -378,7 +477,7 @@ class CollectionPipeline:
                 "yes" if post.has_ai_label else "no",
             )
 
-        # --- Step 3e: the comment thread ----------------------------------
+        # --- Step 3d: the comment thread ----------------------------------
         comment_count = 0
         for comment in self.client.fetch_comments(
             post_id=post.post_id,
@@ -392,7 +491,7 @@ class CollectionPipeline:
 
 
 def run_collection(settings: Settings, client: Optional[TikTokClient] = None) -> CollectionStats:
-    """Convenience wrapper: build a pipeline, run it, close the client.
+    """Build a pipeline, run it, and close the client.
 
     Args:
         settings: The validated configuration.
@@ -405,6 +504,4 @@ def run_collection(settings: Settings, client: Optional[TikTokClient] = None) ->
     try:
         return pipeline.run()
     finally:
-        # `finally` ensures the HTTP session is closed even if the run raised,
-        # so the process never exits leaving sockets open.
         pipeline.client.close()

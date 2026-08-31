@@ -7,7 +7,6 @@ Package layout
     logging_setup.py  Configures file + console logging for a run.
     models.py         The Post and Comment data classes, and the CSV schemas.
     storage.py        Append-safe, resumable CSV writers.
-    downloader.py     Downloads .mp4 files, named by post_id.
     transfer.py       Copies the finished dataset to the college server.
     pipeline.py       Orchestrates all of the above into one collection run.
     clients/          The data sources (mock and live Research API).

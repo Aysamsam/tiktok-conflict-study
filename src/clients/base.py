@@ -1,31 +1,11 @@
 """
 The abstract contract that every TikTok data source must satisfy.
 
-THE CENTRAL DESIGN IDEA OF THIS PROJECT
----------------------------------------
-The pipeline never talks to TikTok directly. It talks to a `TikTokClient`.
-`TikTokClient` is an abstract base class: it declares WHAT a data source must
-be able to do, without saying anything about HOW.
-
-Two concrete implementations exist:
-
-    MockTikTokClient      - fabricates plausible data offline (development)
-    ResearchApiClient     - calls the real TikTok Research API (production)
-
-Because both satisfy the same interface, the pipeline code is written once and
-works with either. Swapping them is a single line in the .env file.
-
-This matters for three practical reasons in a research setting:
-
-  1. The pipeline can be developed, demonstrated and reviewed long before the
-     institutional Research API application is approved.
-  2. The test suite runs in under a second, offline, with no credentials and
-     no rate limits - so the logic can be verified continuously.
-  3. If TikTok changes its API, or the study later adds a second platform, the
-     change is confined to one new client class. Nothing downstream moves.
-
-This is the "dummy API" the study brief asked for, expressed as a proper
-software interface rather than as commented-out code.
+The pipeline never talks to TikTok directly - it talks to a `TikTokClient`.
+Two implementations exist: `MockTikTokClient` (offline synthetic data) and
+`ResearchApiClient` (the real TikTok Research API). Because both satisfy the
+same interface, the pipeline is written once and swapping between them is a
+single line in `.env`.
 """
 
 from __future__ import annotations
@@ -38,21 +18,15 @@ from ..models import Comment, Post
 
 
 class TikTokClientError(Exception):
-    """Raised when a data source fails in a way the pipeline should handle.
-
-    Wrapping provider-specific failures (an HTTP 429, an expired OAuth token, a
-    malformed JSON body) in one exception type means the pipeline can decide
-    what to do about "the data source failed" without needing to know anything
-    about HTTP or about TikTok's error codes.
-    """
+    """Raised when a data source fails in a way the pipeline should handle."""
 
 
 class TikTokClient(ABC):
     """Abstract interface for any source of TikTok posts and comments.
 
-    A subclass must implement exactly two methods. Everything else in the
-    project - deduplication, CSV writing, video downloading, server transfer -
-    is provider-independent and lives elsewhere.
+    A subclass must implement `search_posts` and `fetch_comments`. Everything
+    else - deduplication, CSV writing, server transfer - is provider-independent
+    and lives elsewhere.
     """
 
     @abstractmethod
@@ -63,30 +37,37 @@ class TikTokClient(ABC):
         end_date: date,
         language: str,
         max_posts: int,
+        keywords: Optional[List[str]] = None,
+        random_order: bool = False,
     ) -> Iterator[Post]:
         """Yield posts matching the study's search criteria.
 
         Args:
-            hashtags:   Tag names WITHOUT '#'. Matching is OR: a post qualifies
-                        if it carries any one of these tags.
+            hashtags:   Tag names without '#'. Matching is OR: a post
+                        qualifies if it carries any one of these tags.
             start_date: First day of the collection window, inclusive.
             end_date:   Last day of the collection window, inclusive.
             language:   ISO 639-1 code; posts in other languages are excluded.
             max_posts:  Stop after yielding this many posts.
+            keywords:   Free-text terms, matched against the caption. When
+                        given, a post qualifies via hashtags OR keywords -
+                        this widens the search rather than narrowing it.
+            random_order: When False (default), results come back in the
+                        source's natural order. For the real API this is
+                        decreasing video-ID order - effectively newest-first
+                        - which can cluster a whole sample into a narrow
+                        time window even when the requested date range is
+                        wide. True asks for a random sample instead.
 
         Yields:
-            Fully populated `Post` objects, already translated out of whatever
-            format the underlying source uses.
+            Fully populated `Post` objects.
 
         Raises:
             TikTokClientError: On an unrecoverable failure of the data source.
 
-        WHY AN ITERATOR RATHER THAN A LIST?
-        A list would require holding every result in memory and would force the
-        caller to wait for the entire (potentially hours-long, paginated)
-        search to finish before processing anything. Yielding one post at a
-        time lets the pipeline write each row and download each video as soon
-        as it arrives, so an interrupted run still leaves usable data on disk.
+        Yields one post at a time (rather than returning a list) so the
+        pipeline can write each row as soon as it arrives, keeping an
+        interrupted run's partial output usable.
         """
         raise NotImplementedError
 
@@ -96,9 +77,7 @@ class TikTokClient(ABC):
 
         Args:
             post_id:      The video whose comments to retrieve.
-            max_comments: Hard cap on how many to yield. Popular posts in this
-                          study can carry six-figure comment counts; the cap
-                          bounds both runtime and storage.
+            max_comments: Hard cap on how many to yield.
 
         Yields:
             `Comment` objects.
@@ -106,57 +85,16 @@ class TikTokClient(ABC):
         Raises:
             TikTokClientError: On an unrecoverable failure.
 
-        NOTE: Some posts have comments disabled, and some are unavailable to
-        the Research API. An implementation should yield nothing in that case
-        rather than raising - a post without comments is a normal, expected
-        observation, not an error.
+        Some posts have comments disabled or are unavailable to the Research
+        API; an implementation should yield nothing in that case rather than
+        raising - it is a normal observation, not an error.
         """
         raise NotImplementedError
 
-    def resolve_video_download_url(self, post: Post) -> Optional[str]:
-        """Return a directly downloadable media URL for `post`, or None.
-
-        This is deliberately NOT abstract: it has a default implementation that
-        returns None, meaning "this data source cannot supply a media file".
-
-        WHY THE DEFAULT IS None - AN IMPORTANT COMPLIANCE NOTE
-        ------------------------------------------------------
-        The TikTok Research API returns post METADATA. It does not return a
-        direct .mp4 link, and TikTok's Terms of Service restrict scraping the
-        media CDN. Downloading the raw video files therefore requires either:
-
-          (a) an explicit media-access provision in your institution's Research
-              API agreement, or
-          (b) a separate, licensed data provider, or
-          (c) documented, ethics-approved manual retrieval.
-
-        Rather than silently doing something questionable, this method returns
-        None by default and the pipeline records the video as "not downloaded"
-        while keeping every other field intact. When your institution confirms
-        which route applies, implement this one method in one client class and
-        video downloading begins working - no other file changes.
-
-        Returns:
-            A URL string that `downloader.py` can fetch, or None if this source
-            cannot provide the media file.
-        """
-        return None
-
     def close(self) -> None:
-        """Release any resources held by the client (sockets, sessions).
-
-        Default implementation does nothing, which is correct for the mock
-        client. Network-backed clients override it to close their HTTP session
-        so that the process exits cleanly instead of leaving sockets open.
-        """
+        """Release any resources held by the client (sockets, sessions)."""
         return None
 
-    # Supporting `with` blocks means the pipeline can guarantee cleanup even
-    # if an exception occurs mid-collection:
-    #
-    #     with build_client(settings) as client:
-    #         ...
-    #
     def __enter__(self) -> "TikTokClient":
         return self
 

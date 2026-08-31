@@ -6,19 +6,16 @@
 # committing .env would leak the institution's TikTok API secret.
 .env
 
-# Collected research data. Excluded for three reasons:
-#   1. Size - video files quickly reach many gigabytes.
-#   2. Ethics - the dataset contains personal data (usernames, comment text)
+# Collected research data. Excluded for two reasons:
+#   1. Ethics - the dataset contains personal data (usernames, comment text)
 #      and must live only on approved storage, not on a code host.
-#   3. Reproducibility - the code reproduces the data; the data is an output.
+#   2. Reproducibility - the code reproduces the data; the data is an output.
 data/*.csv
-downloads/videos/*.mp4
 logs/*.log
 
 # Keep the empty directories themselves in the repository so that a fresh
 # clone has the correct structure before the first run.
 !data/.gitkeep
-!downloads/videos/.gitkeep
 !logs/.gitkeep
 
 # Standard Python artefacts.
@@ -28,3 +25,6 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# Visual Studio IDE cache (not part of the project).
+.vs/

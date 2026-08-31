@@ -1,25 +1,11 @@
 """
 CSV persistence: writing posts and comments to disk safely and resumably.
 
-THE THREE PROBLEMS THIS MODULE SOLVES
--------------------------------------
-1. RESUMABILITY. A collection run can take hours and can be interrupted by a
-   dropped connection, an exhausted rate limit, or a server reboot. Writing
-   each row the moment it arrives - rather than accumulating everything in
-   memory and saving at the end - means an interrupted run leaves a valid,
-   usable CSV containing everything collected so far.
-
-2. DEDUPLICATION. Re-running the collector (to resume, or to extend the sample)
-   will re-encounter posts already saved. The same hashtag appearing in several
-   search chunks also returns overlapping results. Writing those rows twice
-   would inflate every count in the analysis. This module loads the IDs already
-   present in the file at start-up and refuses to write a duplicate.
-
-3. CORRECT ENCODING AND ESCAPING. Captions and comments in this study contain
-   commas, quotation marks, newlines, emoji, and Arabic, Hebrew and Persian
-   text. Naive string concatenation into a .csv file corrupts all of these.
-   Python's `csv` module handles the escaping; `encoding="utf-8"` and
-   `newline=""` handle the rest.
+Each row is flushed as soon as it is written, so an interrupted run leaves a
+valid, usable CSV of everything collected so far. IDs already present in the
+file are loaded at start-up, so re-running the collector never writes a
+duplicate row. `encoding="utf-8"` and `newline=""` keep the Arabic, Hebrew,
+Persian and emoji text in this dataset intact and correctly escaped.
 """
 
 from __future__ import annotations
@@ -37,8 +23,7 @@ logger = logging.getLogger(__name__)
 class CsvWriter:
     """Append-only CSV writer with a header guarantee and duplicate rejection.
 
-    One instance manages one file. It is used as a context manager so that the
-    file handle is always flushed and closed, even if the run crashes:
+    One instance manages one file, used as a context manager:
 
         with CsvWriter(path, COLUMNS, "post_id") as writer:
             writer.write_row(post.to_csv_row())
@@ -50,7 +35,7 @@ class CsvWriter:
         Args:
             path:      The .csv file to append to. Created if absent.
             columns:   The authoritative column list from `models.py`. This
-                       becomes the header row and fixes the column ORDER.
+                       becomes the header row and fixes the column order.
             id_column: The column holding the unique key ("post_id" or
                        "comment_id"). Used for duplicate detection.
         """
@@ -58,46 +43,32 @@ class CsvWriter:
         self.columns = columns
         self.id_column = id_column
 
-        # Set membership is an O(1) operation, so checking a candidate ID
-        # against a set of a million already-seen IDs is effectively free. A
-        # list would make it O(n) and turn the run quadratic.
         self._seen_ids: Set[str] = set()
 
         self._file = None    # the open file handle, set in __enter__
         self._writer = None  # the csv.DictWriter, set in __enter__
         self._rows_written = 0
 
-        # Ensure the parent directory exists before trying to open a file in it.
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def __enter__(self) -> "CsvWriter":
         """Open the file for appending and load existing IDs."""
-        # Read the IDs already in the file BEFORE opening it for writing, so
-        # that a resumed run knows exactly what it must not duplicate.
         self._load_existing_ids()
 
-        # A file that does not exist yet, or exists but is empty, needs a
-        # header row written first.
         needs_header = (not self.path.exists()) or self.path.stat().st_size == 0
 
-        # Mode "a" (append) rather than "w" (write) is what makes the file
-        # resumable: reopening never truncates data from a previous run.
-        #
-        # newline="" is REQUIRED on Windows. Without it, Python's universal
-        # newline translation turns the csv module's "\r\n" into "\r\r\n",
-        # producing a blank line between every data row.
-        #
-        # encoding="utf-8" is required for the non-Latin text in this dataset.
+        # Append mode ("a") is what makes the file resumable: reopening never
+        # truncates data from a previous run. newline="" is required on
+        # Windows to avoid the csv module's line endings being doubled.
         self._file = open(self.path, mode="a", newline="", encoding="utf-8")
 
-        # `extrasaction="ignore"` means a dictionary containing keys not in
-        # `columns` will not raise. A MISSING key still raises, which is the
-        # protection we want: forgetting a required field must be loud.
+        # extrasaction="ignore": a dict with extra keys is fine. A MISSING
+        # key still raises - forgetting a required field must be loud.
         self._writer = csv.DictWriter(
             self._file,
             fieldnames=self.columns,
             extrasaction="ignore",
-            quoting=csv.QUOTE_MINIMAL,   # quote only cells that need it
+            quoting=csv.QUOTE_MINIMAL,
         )
 
         if needs_header:
@@ -116,13 +87,7 @@ class CsvWriter:
         logger.info("%s: %d new row(s) written.", self.path.name, self._rows_written)
 
     def _load_existing_ids(self) -> None:
-        """Populate `_seen_ids` from the file's current contents.
-
-        Called once at start-up. On a fresh run the file does not exist and
-        this returns immediately; on a resumed run it reads the whole file.
-        Reading a large CSV costs a few seconds, which is a small price for
-        never producing a duplicated dataset.
-        """
+        """Populate `_seen_ids` from the file's current contents."""
         if not self.path.exists() or self.path.stat().st_size == 0:
             logger.debug("%s does not exist yet - starting fresh.", self.path.name)
             return
@@ -134,9 +99,6 @@ class CsvWriter:
                     if existing_id:
                         self._seen_ids.add(existing_id)
         except (OSError, csv.Error) as exc:
-            # A corrupt or unreadable existing file must not silently become an
-            # empty seen-set, because that would cause duplicate rows to be
-            # appended to an already-damaged file.
             raise RuntimeError(
                 f"Could not read existing data from {self.path}: {exc}. "
                 "Inspect or move the file before re-running."
@@ -150,9 +112,8 @@ class CsvWriter:
     def already_have(self, record_id: str) -> bool:
         """Return True if `record_id` is already stored in this file.
 
-        Exposed publicly so the pipeline can skip the expensive work
-        (downloading a video, fetching a comment thread) for a post it has
-        already collected - not merely skip the CSV write.
+        Lets the pipeline skip expensive work (downloading a video, fetching
+        a comment thread) for a post it has already collected.
         """
         return record_id in self._seen_ids
 
@@ -164,8 +125,7 @@ class CsvWriter:
                  `Comment.to_csv_row()`.
 
         Returns:
-            True if the row was written; False if it was a duplicate and was
-            skipped. The pipeline uses this to keep accurate counts.
+            True if the row was written; False if it was a duplicate.
         """
         if self._writer is None:
             raise RuntimeError(
@@ -185,10 +145,7 @@ class CsvWriter:
         self._seen_ids.add(record_id)
         self._rows_written += 1
 
-        # Flush after every row. This is the single most important line for
-        # resumability: without it, Python buffers roughly 8 KB of output, and
-        # a crash would lose the most recent few dozen records. The performance
-        # cost is negligible compared to the network calls that produced them.
+        # Flush after every row so a crash loses at most the write in flight.
         self._file.flush()
         return True
 
@@ -199,18 +156,12 @@ class CsvWriter:
 
     @property
     def total_records(self) -> int:
-        """How many records exist in the file in total: prior runs plus this one.
-
-        This is the number that matters for a sample-size target. Counting only
-        the rows written during the CURRENT run would mean that re-running a
-        completed collection appends another full sample, silently growing the
-        dataset past the size the study design specifies.
-        """
+        """How many records exist in the file in total (prior runs plus this one)."""
         return len(self._seen_ids)
 
 
 # ---------------------------------------------------------------------------
-# Convenience wrappers - thin, typed front doors for the pipeline.
+# Convenience wrappers
 # ---------------------------------------------------------------------------
 
 def open_posts_writer(path: Path) -> CsvWriter:

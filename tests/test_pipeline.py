@@ -1,29 +1,18 @@
 """
 Automated tests for the collection pipeline.
 
-WHY A RESEARCH SCRIPT NEEDS TESTS
----------------------------------
-A bug in analysis code produces a wrong number, which a reviewer might catch.
-A bug in COLLECTION code produces a wrong dataset, and by the time anyone
-notices, the posts have been deleted, the engagement counts have changed, and
-the data cannot be re-collected. Collection code has one chance to be correct.
+Verifies the properties the study's validity depends on: the CSV schema
+matches spec, no post or comment is ever written twice, every comment maps
+to an existing post, an interrupted run resumes without duplicating,
+inclusion/exclusion criteria are applied correctly, and text containing
+commas, quotes, newlines and emoji survives the round trip.
 
-These tests verify the properties the study's validity depends on:
-
-  * the CSV columns match the documented schema exactly;
-  * no post or comment is ever written twice (which would inflate every count);
-  * every comment maps to a post that exists (referential integrity);
-  * an interrupted run leaves valid data and resumes without duplicating;
-  * posts outside the study's criteria are excluded, and posts inside are not;
-  * text containing commas, quotes, newlines and emoji survives the round trip.
-
-RUNNING THEM
-------------
+Run with:
     pip install pytest
     python -m pytest tests/ -v
 
-Every test runs offline against the mock client in a temporary directory, so
-they need no credentials, touch no real data, and finish in about a second.
+All tests run offline against the mock client, so they need no credentials
+and finish in about a second.
 """
 
 from __future__ import annotations
@@ -40,9 +29,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.clients.mock_client import MockTikTokClient          # noqa: E402
 from src.config import ConfigError, Settings                  # noqa: E402
-from src.models import COMMENT_CSV_COLUMNS, POST_CSV_COLUMNS, Comment, Post  # noqa: E402
+from src.models import COMMENT_CSV_COLUMNS, POST_CSV_COLUMNS, Post  # noqa: E402
 from src.pipeline import CollectionPipeline                   # noqa: E402
-from src.storage import open_posts_writer                     # noqa: E402
+from src.storage import open_comments_writer, open_posts_writer  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -52,10 +41,8 @@ from src.storage import open_posts_writer                     # noqa: E402
 def make_settings(tmp_path: Path, **overrides) -> Settings:
     """Build a Settings object pointing at a temporary directory.
 
-    Constructing `Settings` directly - rather than through `load_settings()` -
-    keeps the tests completely independent of whatever is in the developer's
-    real .env file. A test that passes on one machine therefore passes on all
-    of them.
+    Constructs `Settings` directly rather than via `load_settings()`, so
+    tests are independent of whatever is in the developer's real .env file.
     """
     defaults = dict(
         client_type="mock",
@@ -67,17 +54,24 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         start_date=date(2026, 4, 1),
         end_date=date(2026, 7, 31),
         hashtags=["IsraelIran", "IsraelIranWar", "Iranwar", "Iran"],
-        language="en",
-        # Language detection is switched off in most tests so that the mock's
-        # synthetic captions are not filtered out. The filter has its own
-        # dedicated tests in TestLanguageFilter below.
+        keywords=[],
+        languages=["en"],
+        random_order=False,
+        # Off by default so the mock's synthetic captions aren't filtered
+        # out; language detection has its own tests in TestLanguageFilter.
         language_mode="off",
         max_posts=5,
         search_overfetch_factor=3,
         max_comments_per_post=10,
+        min_comments=0,
+        require_ai_label=False,
+        require_regions=[],
+        sort_by="none",
+        boost_hashtags=[],
+        boost_multiplier=1.2,
+        max_posts_per_account=0,
         daily_request_quota=1000,
         output_root=tmp_path,
-        download_videos=False,      # no network in tests
         transfer_mode="none",
         server_dest_path="",
         server_host="",
@@ -112,22 +106,24 @@ class TestConfiguration:
     """The configuration layer must reject bad input at start-up, not mid-run."""
 
     def test_reversed_date_range_is_rejected(self, tmp_path):
-        """An end date before the start date must fail immediately."""
         with pytest.raises(ConfigError, match="after"):
             make_settings(tmp_path, start_date=date(2026, 7, 31), end_date=date(2026, 4, 1))
 
-    def test_empty_hashtag_list_is_rejected(self, tmp_path):
-        """Searching for nothing is always a configuration mistake."""
+    def test_empty_hashtags_and_keywords_is_rejected(self, tmp_path):
         with pytest.raises(ConfigError, match="empty"):
-            make_settings(tmp_path, hashtags=[])
+            make_settings(tmp_path, hashtags=[], keywords=[])
+
+    def test_empty_hashtags_with_keywords_set_is_allowed(self, tmp_path):
+        """Keyword-only search (no hashtags at all) must be a valid config."""
+        s = make_settings(tmp_path, hashtags=[], keywords=["iran war"])
+        assert s.hashtags == []
+        assert s.keywords == ["iran war"]
 
     def test_unknown_client_type_is_rejected(self, tmp_path):
-        """A typo in TIKTOK_CLIENT must be caught, not silently defaulted."""
         with pytest.raises(ConfigError, match="mock"):
             make_settings(tmp_path, client_type="tiktok_scraper")
 
     def test_research_api_requires_real_credentials(self, tmp_path):
-        """Selecting the live API with placeholder keys must fail loudly."""
         with pytest.raises(ConfigError, match="placeholder"):
             make_settings(
                 tmp_path,
@@ -137,15 +133,10 @@ class TestConfiguration:
             )
 
     def test_directory_layout_is_derived_from_output_root(self, tmp_path):
-        """Changing OUTPUT_ROOT must relocate the ENTIRE dataset.
-
-        This is the property that makes the local-to-server migration a
-        one-line change, so it is worth asserting explicitly.
-        """
+        """Changing OUTPUT_ROOT must relocate the entire dataset."""
         s = make_settings(tmp_path)
         assert s.posts_csv == tmp_path / "data" / "raw_posts.csv"
         assert s.comments_csv == tmp_path / "data" / "raw_comments.csv"
-        assert s.videos_dir == tmp_path / "downloads" / "videos"
 
 
 # ---------------------------------------------------------------------------
@@ -168,21 +159,13 @@ class TestSchema:
         assert header == COMMENT_CSV_COLUMNS
 
     def test_ai_label_is_written_as_1_or_0(self, settings):
-        """The schema specifies a numeric flag, not the text True/False.
-
-        Numeric flags import cleanly into R and SPSS; the strings "True" and
-        "False" are read as text and silently break numeric summaries.
-        """
+        """A numeric flag, not the text True/False."""
         CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
         for row in read_csv(settings.posts_csv):
             assert row["has_ai_label"] in {"0", "1"}
 
     def test_post_ids_are_preserved_exactly(self, settings):
-        """19-digit IDs must survive as strings, with no rounding.
-
-        Treating these as floats anywhere in the chain would corrupt the key
-        that links posts, comments and video files together.
-        """
+        """19-digit IDs must survive as strings, with no rounding."""
         CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
         for row in read_csv(settings.posts_csv):
             assert row["post_id"].isdigit()
@@ -197,34 +180,23 @@ class TestDataIntegrity:
     """Properties the study's statistical validity depends upon."""
 
     def test_no_duplicate_posts(self, settings):
-        """Every post_id must appear exactly once."""
         CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
         ids = [row["post_id"] for row in read_csv(settings.posts_csv)]
         assert len(ids) == len(set(ids))
 
     def test_no_duplicate_comments(self, settings):
-        """Every comment_id must appear exactly once."""
         CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
         ids = [row["comment_id"] for row in read_csv(settings.comments_csv)]
         assert len(ids) == len(set(ids))
 
     def test_every_comment_maps_to_a_collected_post(self, settings):
-        """Referential integrity: no orphan comments.
-
-        A comment whose post_id is absent from raw_posts.csv cannot be
-        analysed, because none of the post-level variables are available.
-        """
+        """No orphan comments: every post_id must exist in raw_posts.csv."""
         CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
         post_ids = {row["post_id"] for row in read_csv(settings.posts_csv)}
         for comment in read_csv(settings.comments_csv):
             assert comment["post_id"] in post_ids
 
     def test_comments_never_predate_their_post(self, settings):
-        """A comment cannot exist before the video it replies to.
-
-        This guards a real bug found during development, where the mock
-        generated comment timestamps independently of the post's own.
-        """
         CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
         post_times = {r["post_id"]: r["create_time"] for r in read_csv(settings.posts_csv)}
         for comment in read_csv(settings.comments_csv):
@@ -232,7 +204,6 @@ class TestDataIntegrity:
             assert comment["create_time"] >= post_times[comment["post_id"]]
 
     def test_comment_cap_is_respected(self, settings):
-        """No post may exceed STUDY_MAX_COMMENTS_PER_POST comments."""
         settings = make_settings(settings.output_root, max_comments_per_post=4)
         CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
 
@@ -243,20 +214,13 @@ class TestDataIntegrity:
         assert all(count <= 4 for count in counts.values())
 
     def test_sample_size_is_respected(self, settings):
-        """The run must stop at exactly STUDY_MAX_POSTS posts."""
         settings = make_settings(settings.output_root, max_posts=3)
         stats = CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
         assert stats.posts_saved == 3
         assert len(read_csv(settings.posts_csv)) == 3
 
     def test_target_sample_size_is_reached_despite_language_filtering(self, tmp_path):
-        """Local filtering must not silently shrink the sample.
-
-        The language criterion is applied AFTER retrieval, so some fetched
-        posts are discarded. Without over-fetching, asking for 20 posts and
-        rejecting 3 as non-English would quietly yield 17 - undershooting the
-        study design in a way nothing in the output would flag.
-        """
+        """Local filtering must not silently shrink the sample below target."""
         settings = make_settings(
             tmp_path,
             max_posts=10,
@@ -280,15 +244,7 @@ class TestResumability:
     """An interrupted run must resume cleanly without duplicating data."""
 
     def test_second_run_adds_nothing(self, settings):
-        """Re-running a completed collection must be a no-op.
-
-        This is what makes the collector safe to re-launch after a crash, a
-        rate-limit pause, or an overnight server reboot.
-
-        Note that the sample size is measured against the TOTAL dataset, not
-        against what one run happened to add. Were it otherwise, every re-run
-        would append another full sample and silently inflate the study's n.
-        """
+        """Sample size is measured against the total dataset, not just this run's additions."""
         first = CollectionPipeline(settings, client=MockTikTokClient()).run()
         assert first.posts_saved == 5
 
@@ -297,11 +253,6 @@ class TestResumability:
         assert len(read_csv(settings.posts_csv)) == 5
 
     def test_completed_sample_does_not_contact_the_api(self, settings):
-        """A finished collection must not spend API quota re-searching.
-
-        The daily quota is 1000 requests; wasting it re-fetching posts that are
-        already on disk, only to discard them as duplicates, is a real cost.
-        """
         CollectionPipeline(settings, client=MockTikTokClient()).run()
 
         class ExplodingClient(MockTikTokClient):
@@ -326,12 +277,7 @@ class TestResumability:
         assert len({r["post_id"] for r in rows}) == 12, "top-up introduced duplicates"
 
     def test_mock_client_is_deterministic(self, settings):
-        """The same configuration must produce the same synthetic post IDs.
-
-        This guards a real bug found during development: the seed was derived
-        from Python's built-in hash(), which is randomised per process, so
-        every run produced different IDs and deduplication could never engage.
-        """
+        """The same configuration must produce the same synthetic post IDs."""
         def collect_ids():
             client = MockTikTokClient()
             return [
@@ -339,7 +285,7 @@ class TestResumability:
                     hashtags=settings.hashtags,
                     start_date=settings.start_date,
                     end_date=settings.end_date,
-                    language=settings.language,
+                    language=", ".join(settings.languages),
                     max_posts=5,
                 )
             ]
@@ -348,7 +294,6 @@ class TestResumability:
 
     def test_partial_file_is_extended_not_overwritten(self, settings):
         """Existing rows must survive a subsequent run."""
-        # Simulate a previous run that captured one post.
         settings.ensure_directories()
         with open_posts_writer(settings.posts_csv) as writer:
             writer.write_row(Post(
@@ -398,7 +343,6 @@ class TestEligibilityFiltering:
         assert self._pipeline(settings)._is_eligible(self._post(hashtags=["Iran"]))
 
     def test_hashtag_matching_ignores_case(self, settings):
-        """TikTok preserves the author's capitalisation; the study must not."""
         assert self._pipeline(settings)._is_eligible(self._post(hashtags=["ISRAELIRAN"]))
         assert self._pipeline(settings)._is_eligible(self._post(hashtags=["israeliran"]))
 
@@ -408,7 +352,6 @@ class TestEligibilityFiltering:
         )
 
     def test_post_outside_the_date_window_is_excluded(self, settings):
-        """A post from before the study window must not enter the sample."""
         assert not self._pipeline(settings)._is_eligible(
             self._post(create_time="2026-01-01T12:00:00+00:00")
         )
@@ -419,6 +362,109 @@ class TestEligibilityFiltering:
         assert pipeline._is_eligible(self._post(create_time="2026-04-01T00:00:00+00:00"))
         assert pipeline._is_eligible(self._post(create_time="2026-07-31T23:59:59+00:00"))
 
+    def test_require_ai_label_excludes_unlabelled_posts(self, tmp_path):
+        settings = make_settings(tmp_path, require_ai_label=True)
+        pipeline = self._pipeline(settings)
+        assert not pipeline._is_eligible(self._post(has_ai_label=False))
+        assert pipeline._is_eligible(self._post(has_ai_label=True))
+
+    def test_ai_label_not_required_by_default(self, settings):
+        assert self._pipeline(settings)._is_eligible(self._post(has_ai_label=False))
+
+    def test_require_regions_excludes_other_regions(self, tmp_path):
+        settings = make_settings(tmp_path, require_regions=["IR"])
+        pipeline = self._pipeline(settings)
+        assert not pipeline._is_eligible(self._post(author_region="US"))
+        assert pipeline._is_eligible(self._post(author_region="IR"))
+
+    def test_require_regions_matches_case_insensitively(self, tmp_path):
+        """TikTok returns region codes in inconsistent case ("US" vs "us")."""
+        settings = make_settings(tmp_path, require_regions=["IR"])
+        pipeline = self._pipeline(settings)
+        assert pipeline._is_eligible(self._post(author_region="ir"))
+
+    def test_region_not_required_by_default(self, settings):
+        assert self._pipeline(settings)._is_eligible(self._post(author_region="US"))
+
+
+# ---------------------------------------------------------------------------
+# Per-account cap
+# ---------------------------------------------------------------------------
+
+class TestAccountCap:
+    """STUDY_MAX_POSTS_PER_ACCOUNT must stop one account from filling the sample."""
+
+    def _post(self, post_id, username, view_count=100) -> Post:
+        return Post(
+            post_id=post_id,
+            username=username,
+            author_region="US",
+            create_time="2026-05-15T12:00:00+00:00",
+            caption="a caption long enough to not be treated as undetermined",
+            hashtags=["Iran"],
+            video_url="https://example.invalid",
+            has_ai_label=False,
+            view_count=view_count, like_count=0, comment_count=0, share_count=0,
+        )
+
+    def _run(self, settings, posts):
+        pipeline = CollectionPipeline(settings, client=MockTikTokClient(seed=1))
+        settings.ensure_directories()
+        if settings.max_posts_per_account > 0:
+            pipeline._account_counts = pipeline._load_account_counts(settings.posts_csv)
+        with open_posts_writer(settings.posts_csv) as posts_writer, \
+             open_comments_writer(settings.comments_csv) as comments_writer:
+            if settings.sort_by == "view_count":
+                pipeline._run_ranked(iter(posts), posts_writer, comments_writer)
+            else:
+                pipeline._run_streaming(iter(posts), posts_writer, comments_writer)
+        return pipeline
+
+    def test_streaming_mode_respects_the_cap(self, tmp_path):
+        settings = make_settings(
+            tmp_path, max_posts=10, max_posts_per_account=1, sort_by="none",
+        )
+        posts = [self._post(str(7_000_000_000_000_000_000 + i), "same_user") for i in range(5)]
+        pipeline = self._run(settings, posts)
+
+        rows = read_csv(settings.posts_csv)
+        assert len(rows) == 1
+        assert pipeline.stats.posts_skipped_account_cap == 4
+
+    def test_ranked_mode_keeps_the_best_post_per_account_and_backfills(self, tmp_path):
+        """A capped account must not block a lower-ranked post from someone else."""
+        settings = make_settings(
+            tmp_path, max_posts=2, max_posts_per_account=1, sort_by="view_count",
+        )
+        posts = [
+            self._post("7000000000000000001", "user_a", view_count=500),
+            self._post("7000000000000000002", "user_a", view_count=900),
+            self._post("7000000000000000003", "user_b", view_count=300),
+        ]
+        pipeline = self._run(settings, posts)
+
+        rows = read_csv(settings.posts_csv)
+        ids = {r["post_id"] for r in rows}
+        assert len(rows) == 2
+        assert "7000000000000000002" in ids, "user_a's higher-view post should win"
+        assert "7000000000000000001" not in ids, "user_a is capped at one post"
+        assert "7000000000000000003" in ids, "user_b should backfill the freed slot"
+        assert pipeline.stats.posts_skipped_account_cap == 1
+
+    def test_cap_holds_across_a_resumed_run(self, tmp_path):
+        """An account's posts from a prior run must still count toward the cap."""
+        settings = make_settings(
+            tmp_path, max_posts=10, max_posts_per_account=1, sort_by="none",
+        )
+        self._run(settings, [self._post("7000000000000000001", "same_user")])
+        assert len(read_csv(settings.posts_csv)) == 1
+
+        pipeline = self._run(
+            settings, [self._post("7000000000000000002", "same_user")],
+        )
+        assert len(read_csv(settings.posts_csv)) == 1
+        assert pipeline.stats.posts_skipped_account_cap == 1
+
 
 # ---------------------------------------------------------------------------
 # Text handling
@@ -428,11 +474,6 @@ class TestTextHandling:
     """Awkward characters must survive the write/read round trip intact."""
 
     def test_difficult_text_round_trips_exactly(self, settings):
-        """Commas, quotes, newlines, emoji and non-Latin script must survive.
-
-        These are precisely the characters that naive CSV writing destroys, and
-        precisely the characters this study's data is full of.
-        """
         nasty = 'Caption with, a comma; "quotes"; a\nnewline; emoji \U0001F4A5; عربي; עברית; فارسی'
 
         settings.ensure_directories()
@@ -463,26 +504,88 @@ class TestTextHandling:
         assert post.to_csv_row()["hashtags"] == "IsraelIran,news,osint"
 
     def test_missing_region_becomes_an_empty_cell(self, settings):
-        """An absent optional field must read as blank, not as the word 'None'."""
         CollectionPipeline(settings, client=MockTikTokClient(seed=42)).run()
         for row in read_csv(settings.posts_csv):
             assert row["author_region"] != "None"
 
 
 # ---------------------------------------------------------------------------
-# Date-window splitting (a Research API constraint)
+# Search budget distribution across date-window chunks
+# ---------------------------------------------------------------------------
+
+class TestSearchBudgetDistribution:
+    """Guards the bug where one busy chunk consumed the entire search budget.
+
+    A multi-month window is split into 30-day chunks, but TikTok returns
+    results within a chunk newest-first. Without per-chunk budgeting, a
+    chunk with enough volume on its own satisfies the whole `max_posts`
+    target, and the pipeline never queries the rest of the window at all -
+    silently turning "search six months" into "search whichever 30-day
+    chunk happened to have enough recent posts."
+    """
+
+    def _make_client(self):
+        from src.clients.research_client import ResearchApiClient
+        return ResearchApiClient(
+            client_key="k", client_secret="s",
+            oauth_url="https://example.invalid",
+            video_query_url="https://example.invalid",
+            comment_query_url="https://example.invalid",
+        )
+
+    def test_budget_is_spread_across_chunks_not_consumed_by_the_first(self):
+        client = self._make_client()
+
+        # Every simulated chunk has effectively unlimited supply (50 videos
+        # per page, has_more always True), so the pre-fix behaviour would
+        # let the first chunk alone satisfy the entire target.
+        def fake_request(url, params, body):
+            start = body["start_date"]
+            videos = [
+                {
+                    "id": f"{start}_{i}", "username": "u", "region_code": "US",
+                    "create_time": 1775001600, "video_description": "x",
+                    "hashtag_names": ["Iran"], "view_count": 1, "like_count": 0,
+                    "comment_count": 0, "share_count": 0, "favorites_count": 0,
+                    "video_tag": None,
+                }
+                for i in range(50)
+            ]
+            return {"videos": videos, "has_more": True, "cursor": 1, "search_id": "s"}
+
+        client._request = fake_request
+
+        start_date, end_date = date(2026, 4, 1), date(2026, 6, 29)
+        expected_chunks = len(client._split_date_window(start_date, end_date))
+        assert expected_chunks > 1, "test needs a window spanning multiple chunks"
+
+        posts = list(client.search_posts(
+            hashtags=["Iran"], start_date=start_date, end_date=end_date,
+            language="en", max_posts=30,
+        ))
+
+        assert len(posts) == 30
+
+        from collections import Counter
+        counts = Counter(p.post_id.split("_")[0] for p in posts)
+        assert len(counts) == expected_chunks, (
+            f"expected all {expected_chunks} chunks represented, got {dict(counts)}"
+        )
+        # Roughly even (10 each for a 30/3 split); no single chunk should
+        # dominate the way the pre-fix bug let it.
+        assert max(counts.values()) <= 12, f"one chunk dominated: {dict(counts)}"
+
+
+# ---------------------------------------------------------------------------
+# AI-label extraction
 # ---------------------------------------------------------------------------
 
 class TestAiLabelExtraction:
     """The study's key variable, parsed from the API's `video_tag` field.
 
-    An error here would be near-invisible in the finished dataset: every post
-    would simply read as not-AI-labelled, and nothing would look broken. These
-    tests pin the mapping documented by TikTok:
-
         {"type": "AIGC",    "number": 1} -> Creator Labelled as AI-Generated
         {"type": "AIGC",    "number": 2} -> AI-Generated
-        {"type": "Branded", "number": 1} -> Paid Partnership (NOT an AI label)
+        {"type": "Branded", "number": 1} -> Paid Partnership (not an AI label)
     """
 
     def _extract(self, raw):
@@ -504,15 +607,11 @@ class TestAiLabelExtraction:
         assert self._extract(raw) == (True, "ai_generated")
 
     def test_branded_tag_is_not_an_ai_label(self):
-        """A Paid Partnership disclosure must not be counted as AI content.
-
-        This is the mistake that would inflate the study's headline number.
-        """
+        """A Paid Partnership disclosure must not inflate the study's headline number."""
         raw = {"id": "1", "video_tag": [{"type": "Branded", "number": 1}]}
         assert self._extract(raw) == (False, "")
 
     def test_a_single_struct_is_handled_like_a_list(self):
-        """The API is loosely documented on whether video_tag is a list."""
         raw = {"id": "1", "video_tag": {"type": "AIGC", "number": 2}}
         assert self._extract(raw) == (True, "ai_generated")
 
@@ -524,7 +623,6 @@ class TestAiLabelExtraction:
         assert self._extract(raw) == (True, "creator_labelled")
 
     def test_platform_detection_wins_over_self_disclosure(self):
-        """When both are present, the stronger provenance evidence is recorded."""
         raw = {"id": "1", "video_tag": [
             {"type": "AIGC", "number": 1},
             {"type": "AIGC", "number": 2},
@@ -535,8 +633,18 @@ class TestAiLabelExtraction:
         raw = {"id": "1", "video_tag": [{"type": "aigc", "number": 2}]}
         assert self._extract(raw) == (True, "ai_generated")
 
+    def test_live_api_sends_aigc_type_suffix_not_bare_aigc(self):
+        """Real API responses use 'AIGC Type', not the bare 'AIGC' the docs show.
+
+        Found via a live test collection: every post came back with a
+        video_tag, but has_ai_label was False for all of them because the
+        exact-match check rejected "AIGC Type". Silent and invisible in the
+        finished dataset - nothing looked broken.
+        """
+        raw = {"id": "1", "video_tag": [{"type": "AIGC Type", "number": 1}]}
+        assert self._extract(raw) == (True, "creator_labelled")
+
     def test_unknown_aigc_number_still_counts_as_labelled(self):
-        """If TikTok adds a third AIGC value, it must not read as 'no label'."""
         raw = {"id": "1", "video_tag": [{"type": "AIGC", "number": 99}]}
         has_label, _ = self._extract(raw)
         assert has_label is True
@@ -550,12 +658,6 @@ class TestQueryableFields:
     """Guards the bug where an unsupported filter field 400s every request."""
 
     def test_language_is_not_a_queryable_field(self):
-        """Documents WHY language filtering happens locally.
-
-        An earlier version sent a `video_language` condition, which the video
-        endpoint does not accept - every request would have failed with an
-        opaque HTTP 400.
-        """
         from src.clients.research_client import _QUERYABLE_FIELDS
         assert "video_language" not in _QUERYABLE_FIELDS
         assert "language" not in _QUERYABLE_FIELDS
@@ -565,7 +667,6 @@ class TestQueryableFields:
         assert "hashtag_name" in _QUERYABLE_FIELDS
 
     def test_search_body_only_uses_queryable_fields(self):
-        """Every condition the client builds must use an accepted field."""
         from src.clients.research_client import ResearchApiClient, _QUERYABLE_FIELDS
         client = ResearchApiClient(
             client_key="k", client_secret="s",
@@ -580,6 +681,56 @@ class TestQueryableFields:
         )
         for condition in body["query"]["and"]:
             assert condition["field_name"] in _QUERYABLE_FIELDS
+
+    def test_keyword_only_search_omits_the_hashtag_condition(self):
+        """Empty hashtags with keywords set must search by keyword alone."""
+        from src.clients.research_client import ResearchApiClient
+        client = ResearchApiClient(
+            client_key="k", client_secret="s",
+            oauth_url="https://example.invalid",
+            video_query_url="https://example.invalid",
+            comment_query_url="https://example.invalid",
+        )
+        body = client._build_search_body(
+            hashtags=[], keywords=["iran war"], language="en",
+            start_date=date(2026, 4, 1), end_date=date(2026, 4, 30),
+            page_size=100, cursor=None, search_id=None,
+        )
+        conditions = body["query"]["and"]
+        assert len(conditions) == 1
+        assert conditions[0]["field_name"] == "keyword"
+        assert conditions[0]["field_values"] == ["iran war"]
+
+    def test_random_order_is_omitted_by_default(self):
+        """Default behaviour must be identical to before is_random existed."""
+        from src.clients.research_client import ResearchApiClient
+        client = ResearchApiClient(
+            client_key="k", client_secret="s",
+            oauth_url="https://example.invalid",
+            video_query_url="https://example.invalid",
+            comment_query_url="https://example.invalid",
+        )
+        body = client._build_search_body(
+            hashtags=["Iran"], language="en",
+            start_date=date(2026, 4, 1), end_date=date(2026, 4, 30),
+            page_size=100, cursor=None, search_id=None,
+        )
+        assert "is_random" not in body
+
+    def test_random_order_true_sets_is_random(self):
+        from src.clients.research_client import ResearchApiClient
+        client = ResearchApiClient(
+            client_key="k", client_secret="s",
+            oauth_url="https://example.invalid",
+            video_query_url="https://example.invalid",
+            comment_query_url="https://example.invalid",
+        )
+        body = client._build_search_body(
+            hashtags=["Iran"], language="en",
+            start_date=date(2026, 4, 1), end_date=date(2026, 4, 30),
+            page_size=100, cursor=None, search_id=None, random_order=True,
+        )
+        assert body["is_random"] is True
 
     def test_dates_are_formatted_compactly(self):
         """The API wants '20260401', not '2026-04-01'."""
@@ -599,7 +750,6 @@ class TestQueryableFields:
         assert body["end_date"] == "20260430"
 
     def test_first_request_omits_pagination_fields(self):
-        """Sending a null cursor on the first request causes a 400."""
         from src.clients.research_client import ResearchApiClient
         client = ResearchApiClient(
             client_key="k", client_secret="s",
@@ -620,7 +770,6 @@ class TestLanguageFilter:
     """Local language detection, used because the API offers no such filter."""
 
     def test_cleaning_removes_language_neutral_noise(self):
-        """Hashtags, mentions, URLs and emoji mislead the detector."""
         from src.language import clean_for_detection
         cleaned = clean_for_detection(
             "Breaking news from the region \U0001F525 #Iran #IsraelIran "
@@ -633,36 +782,51 @@ class TestLanguageFilter:
 
     def test_mode_off_accepts_everything(self):
         from src.language import LanguageFilter
-        f = LanguageFilter(target_language="en", mode="off")
+        f = LanguageFilter(target_languages=["en"], mode="off")
         keep, _ = f.matches("این یک متن فارسی است که باید پذیرفته شود")
         assert keep is True
 
     def test_short_captions_are_kept_by_default(self):
-        """Conservative default: over-collect rather than discard permanently.
-
-        A post excluded at collection time cannot be recovered later; a post
-        collected in error can always be filtered during analysis.
-        """
         from src.language import LanguageFilter
-        f = LanguageFilter(target_language="en", mode="detect")
+        f = LanguageFilter(target_languages=["en"], mode="detect")
         keep, reason = f.matches("ok")
         assert keep is True
         assert "too short" in reason
 
     def test_short_captions_can_be_dropped_when_strict(self):
         from src.language import LanguageFilter
-        f = LanguageFilter(target_language="en", mode="detect", keep_undetermined=False)
+        f = LanguageFilter(target_languages=["en"], mode="detect", keep_undetermined=False)
         keep, _ = f.matches("ok")
         assert keep is False
 
     def test_summary_counts_every_decision(self):
-        """Exclusion counts are numbers a methods section must report."""
         from src.language import LanguageFilter
-        f = LanguageFilter(target_language="en", mode="off")
+        f = LanguageFilter(target_languages=["en"], mode="off")
         for _ in range(3):
             f.matches("some caption text here")
         assert f.checked == 3
         assert "3" in f.summary()
+
+    def test_multiple_target_languages_are_all_accepted(self):
+        """A caption in any one of several configured languages is kept."""
+        from src.language import LanguageFilter
+        f = LanguageFilter(target_languages=["en", "fa", "he"], mode="detect")
+        keep_fa, reason_fa = f.matches(
+            "این یک ویدیوی خبری در مورد وضعیت کنونی منطقه است و جزئیات بیشتری ارائه می دهد"
+        )
+        assert keep_fa is True, reason_fa
+        keep_en, reason_en = f.matches(
+            "Breaking news from the region tonight, more details as they come in"
+        )
+        assert keep_en is True, reason_en
+
+    def test_language_outside_the_configured_set_is_rejected(self):
+        from src.language import LanguageFilter
+        f = LanguageFilter(target_languages=["en", "fa", "he"], mode="detect")
+        keep, reason = f.matches(
+            "Bonsoir à tous, voici les dernières nouvelles de la région ce soir"
+        )
+        assert keep is False, reason
 
 
 class TestDateWindowSplitting:
@@ -683,7 +847,6 @@ class TestDateWindowSplitting:
             assert (end - start).days < 30, f"chunk {start}..{end} exceeds the API limit"
 
     def test_chunks_cover_the_window_with_no_gaps_or_overlaps(self):
-        """Gaps would lose posts; overlaps would duplicate them and inflate n."""
         chunks = self._client()._split_date_window(date(2026, 4, 1), date(2026, 7, 31))
 
         assert chunks[0][0] == date(2026, 4, 1), "the window's first day was skipped"
