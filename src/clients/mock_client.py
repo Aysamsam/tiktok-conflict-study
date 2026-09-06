@@ -107,12 +107,15 @@ class MockTikTokClient(TikTokClient):
         max_posts: int,
         keywords: Optional[List[str]] = None,
         random_order: bool = False,
+        min_posts_per_term: int = 0,
     ) -> Iterator[Post]:
         """Yield `max_posts` synthetic posts inside the requested date window.
 
         `random_order` is accepted for interface parity but has no effect
         here - every mock post's fields are already independently randomised
         per index, so there is no "ID order" for it to change.
+        `min_posts_per_term` is likewise accepted but unused - the mock
+        generates a single flat stream rather than stratifying per term.
 
         Signature and behaviour match `ResearchApiClient.search_posts`, so
         the pipeline cannot tell them apart.
@@ -259,4 +262,5 @@ class MockTikTokClient(TikTokClient):
             comment_count=comment_count,
             share_count=share_count,
             favorites_count=int(like_count * rng.uniform(0.01, 0.10)),
+            video_duration=rng.randint(5, 180),
         )

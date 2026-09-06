@@ -64,12 +64,14 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         search_overfetch_factor=3,
         max_comments_per_post=10,
         min_comments=0,
+        max_video_duration_seconds=0,
         require_ai_label=False,
         require_regions=[],
         sort_by="none",
         boost_hashtags=[],
         boost_multiplier=1.2,
         max_posts_per_account=0,
+        min_posts_per_hashtag=0,
         daily_request_quota=1000,
         output_root=tmp_path,
         transfer_mode="none",
@@ -386,6 +388,20 @@ class TestEligibilityFiltering:
     def test_region_not_required_by_default(self, settings):
         assert self._pipeline(settings)._is_eligible(self._post(author_region="US"))
 
+    def test_max_duration_excludes_longer_posts(self, tmp_path):
+        settings = make_settings(tmp_path, max_video_duration_seconds=30)
+        pipeline = self._pipeline(settings)
+        assert pipeline._is_eligible(self._post(video_duration=30))
+        assert not pipeline._is_eligible(self._post(video_duration=31))
+
+    def test_max_duration_not_enforced_by_default(self, settings):
+        assert self._pipeline(settings)._is_eligible(self._post(video_duration=600))
+
+    def test_unreported_duration_is_kept_not_excluded(self, tmp_path):
+        """0 means the API did not report a duration, not a zero-length video."""
+        settings = make_settings(tmp_path, max_video_duration_seconds=30)
+        assert self._pipeline(settings)._is_eligible(self._post(video_duration=0))
+
 
 # ---------------------------------------------------------------------------
 # Per-account cap
@@ -574,6 +590,140 @@ class TestSearchBudgetDistribution:
         # Roughly even (10 each for a 30/3 split); no single chunk should
         # dominate the way the pre-fix bug let it.
         assert max(counts.values()) <= 12, f"one chunk dominated: {dict(counts)}"
+
+
+class TestHashtagStratification:
+    """Guards the bug where one common hashtag drowned out rarer ones.
+
+    Searching several hashtags at once used to send TikTok one combined
+    `hashtag_name IN [...]` condition; `is_random` then drew a uniform
+    sample over the UNION of all matching posts. A hashtag with far more
+    matching posts than the others dominated the sample almost entirely -
+    a live run of 6 hashtags returned 19/30 posts for the broadest tag and
+    0/30 for three narrower ones. The fix searches each term separately and
+    interleaves the results, round-robin, so every term gets a fair share
+    regardless of its relative volume.
+    """
+
+    def _make_client(self):
+        from src.clients.research_client import ResearchApiClient
+        return ResearchApiClient(
+            client_key="k", client_secret="s",
+            oauth_url="https://example.invalid",
+            video_query_url="https://example.invalid",
+            comment_query_url="https://example.invalid",
+        )
+
+    def test_rare_hashtag_is_not_drowned_out_by_a_common_one(self):
+        client = self._make_client()
+
+        # "common" has effectively unlimited supply; "rare" has only 2
+        # matching posts total. Pre-fix, a single combined query would let
+        # "common" fill the entire sample before "rare" ever appeared.
+        def fake_request(url, params, body):
+            field_values = body["query"]["and"][0]["field_values"]
+            assert len(field_values) == 1, "expected one term per stratified request"
+            tag = field_values[0]
+
+            if tag == "common":
+                videos = [
+                    {
+                        "id": f"common_{i}", "username": "u", "region_code": "US",
+                        "create_time": 1775001600, "video_description": "x",
+                        "hashtag_names": ["common"], "view_count": 1, "like_count": 0,
+                        "comment_count": 0, "share_count": 0, "favorites_count": 0,
+                        "video_tag": None,
+                    }
+                    for i in range(50)
+                ]
+                return {"videos": videos, "has_more": True, "cursor": 1, "search_id": "s"}
+
+            # "rare": only 2 posts ever, regardless of how much budget is offered.
+            cursor = body.get("cursor")
+            if cursor is not None:
+                return {"videos": [], "has_more": False, "cursor": None, "search_id": None}
+            videos = [
+                {
+                    "id": f"rare_{i}", "username": "u", "region_code": "US",
+                    "create_time": 1775001600, "video_description": "x",
+                    "hashtag_names": ["rare"], "view_count": 1, "like_count": 0,
+                    "comment_count": 0, "share_count": 0, "favorites_count": 0,
+                    "video_tag": None,
+                }
+                for i in range(2)
+            ]
+            return {"videos": videos, "has_more": False, "cursor": None, "search_id": None}
+
+        client._request = fake_request
+
+        posts = list(client.search_posts(
+            hashtags=["common", "rare"], start_date=date(2026, 4, 1), end_date=date(2026, 4, 20),
+            language="en", max_posts=30,
+        ))
+
+        from collections import Counter
+        counts = Counter(p.hashtags[0] for p in posts)
+
+        # Both terms must be represented - the whole point of the fix.
+        assert counts["rare"] == 2, f"rare hashtag was drowned out: {dict(counts)}"
+        assert counts["common"] > 0
+
+    def test_min_posts_per_term_reserves_a_floor_before_round_robin_fill(self):
+        """Round-robin alone still lets a high-supply term end up with far
+        more posts than a low-supply one, since it simply keeps having a
+        next result available for longer. min_posts_per_term reserves each
+        term's floor first, before the remaining budget is filled by
+        availability.
+        """
+        client = self._make_client()
+
+        def fake_request(url, params, body):
+            field_values = body["query"]["and"][0]["field_values"]
+            tag = field_values[0]
+
+            if tag == "common":
+                videos = [
+                    {
+                        "id": f"common_{i}", "username": "u", "region_code": "US",
+                        "create_time": 1775001600, "video_description": "x",
+                        "hashtag_names": ["common"], "view_count": 1, "like_count": 0,
+                        "comment_count": 0, "share_count": 0, "favorites_count": 0,
+                        "video_tag": None,
+                    }
+                    for i in range(50)
+                ]
+                return {"videos": videos, "has_more": True, "cursor": 1, "search_id": "s"}
+
+            # "rare": only 5 posts ever, regardless of how much budget is offered.
+            cursor = body.get("cursor")
+            if cursor is not None:
+                return {"videos": [], "has_more": False, "cursor": None, "search_id": None}
+            videos = [
+                {
+                    "id": f"rare_{i}", "username": "u", "region_code": "US",
+                    "create_time": 1775001600, "video_description": "x",
+                    "hashtag_names": ["rare"], "view_count": 1, "like_count": 0,
+                    "comment_count": 0, "share_count": 0, "favorites_count": 0,
+                    "video_tag": None,
+                }
+                for i in range(5)
+            ]
+            return {"videos": videos, "has_more": False, "cursor": None, "search_id": None}
+
+        client._request = fake_request
+
+        posts = list(client.search_posts(
+            hashtags=["common", "rare"], start_date=date(2026, 4, 1), end_date=date(2026, 4, 20),
+            language="en", max_posts=30, min_posts_per_term=5,
+        ))
+
+        from collections import Counter
+        counts = Counter(p.hashtags[0] for p in posts)
+
+        # "rare" gets its full available supply reserved up front, not just
+        # whatever round-robin luck would have given it.
+        assert counts["rare"] == 5, f"rare hashtag's floor was not reserved: {dict(counts)}"
+        assert len(posts) == 30
 
 
 # ---------------------------------------------------------------------------

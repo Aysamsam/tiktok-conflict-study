@@ -13,6 +13,13 @@
 data/*.csv
 logs/*.log
 
+# Same reasoning applies to per-run archives and their derived summaries
+# under analysis/ - only the reusable scripts and methodology notes (.py,
+# .md) are safe to commit; the data itself and any text derived from it stay
+# local.
+analysis/**/*.csv
+analysis/**/*.txt
+
 # Keep the empty directories themselves in the repository so that a fresh
 # clone has the correct structure before the first run.
 !data/.gitkeep

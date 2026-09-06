@@ -111,6 +111,11 @@ class Post:
     """Times the video was saved to a user's favourites (API field
     `favorites_count`)."""
 
+    video_duration: int = 0
+    """Video length in seconds (API field `video_duration`). 0 means the
+    API did not report a duration for this post, not that the video is
+    zero-length - see `STUDY_MAX_VIDEO_DURATION_SECONDS` in config.py."""
+
     collected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     """When this row was written, ISO 8601 UTC."""
 
@@ -135,6 +140,7 @@ class Post:
             "comment_count": self.comment_count,
             "share_count": self.share_count,
             "favorites_count": self.favorites_count,
+            "video_duration": self.video_duration,
             "collected_at": self.collected_at,
         }
 
@@ -209,6 +215,7 @@ POST_CSV_COLUMNS: List[str] = [
     "comment_count",    # Integer - total comments reported by TikTok
     "share_count",      # Integer - total shares at collection time
     "favorites_count",  # Integer - times saved to favourites
+    "video_duration",   # Integer - video length in seconds, 0 if unreported
     "collected_at",     # String  - ISO 8601 UTC time this row was written
 ]
 

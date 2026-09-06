@@ -178,6 +178,7 @@ class CollectionPipeline:
                     max_posts=search_budget,
                     keywords=settings.keywords,
                     random_order=settings.random_order,
+                    min_posts_per_term=settings.min_posts_per_hashtag,
                 )
 
                 if settings.sort_by == "view_count":
@@ -413,6 +414,22 @@ class CollectionPipeline:
             logger.debug(
                 "Excluding post %s: comment_count %d is below the minimum of %d.",
                 post.post_id, post.comment_count, self.settings.min_comments,
+            )
+            return False
+
+        # Criterion 4a: must not exceed the maximum video duration, if set.
+        # A duration of 0 means the API did not report one (not that the
+        # video is zero-length), so it is kept rather than excluded - the
+        # same benefit-of-doubt treatment as an unparseable create_time
+        # below.
+        if (
+            self.settings.max_video_duration_seconds > 0
+            and post.video_duration > 0
+            and post.video_duration > self.settings.max_video_duration_seconds
+        ):
+            logger.debug(
+                "Excluding post %s: video_duration %ds exceeds the maximum of %ds.",
+                post.post_id, post.video_duration, self.settings.max_video_duration_seconds,
             )
             return False
 

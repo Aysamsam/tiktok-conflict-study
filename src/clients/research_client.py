@@ -56,7 +56,7 @@ _VIDEO_FIELDS: List[str] = [
     "share_count",       # -> Post.share_count
     "favorites_count",   # -> Post.favorites_count
     "video_tag",         # -> Post.has_ai_label / Post.ai_label_kind  (key field)
-    "video_duration",    # not stored; used only for sanity-checking results
+    "video_duration",    # -> Post.video_duration (seconds)
 ]
 
 # Fields requested from the comment endpoint.
@@ -335,8 +335,135 @@ class ResearchApiClient(TikTokClient):
         max_posts: int,
         keywords: Optional[List[str]] = None,
         random_order: bool = False,
+        min_posts_per_term: int = 0,
     ) -> Iterator[Post]:
-        """Search videos by hashtag (or keyword), date window and language.
+        """Search videos by hashtag(s) and/or keyword(s), date window and language.
+
+        With more than one hashtag/keyword, this stratifies: each term is
+        searched separately and the results are merged round-robin, rather
+        than sending TikTok one combined `hashtag_name IN [...]` condition.
+
+        The combined-query approach was tried first and discarded after live
+        testing showed it badly distorts composition: `is_random` draws a
+        uniform sample over the UNION of all matching posts, so a common
+        term (e.g. "iran") that has orders of magnitude more matching posts
+        than a narrow one (e.g. "usairanwar") drowns the narrow term out
+        almost entirely - one run of 6 hashtags returned 19/30 posts for the
+        broadest tag and 0/30 for three of the narrower ones. Searching each
+        term on its own budget, then interleaving, guarantees every term
+        gets a fair chance regardless of its relative volume.
+
+        `min_posts_per_term` adds a second guarantee on top of round-robin:
+        even fair interleaving still lets a high-supply term end up with far
+        more posts than a low-supply one simply because it keeps having a
+        next result available for longer. When set, each term is drained for
+        up to that many posts FIRST (a reservation pass), before the normal
+        round-robin fills the rest of `max_posts` by availability. Note this
+        reserves raw CANDIDATES yielded from here, upstream of the pipeline's
+        own eligibility filtering (min_comments, duration, language, etc.) -
+        it raises a term's floor in the scanned pool, not a hard guarantee on
+        its share of the final saved sample.
+
+        A single hashtag or single keyword (the common case) skips
+        stratification and behaves exactly as before - see
+        `_search_single_query`.
+        """
+        hashtags = hashtags or []
+        keywords = keywords or []
+        terms = [("hashtag", h) for h in hashtags] + [("keyword", k) for k in keywords]
+
+        if len(terms) <= 1:
+            yield from self._search_single_query(
+                hashtags=hashtags, keywords=keywords, start_date=start_date,
+                end_date=end_date, language=language, max_posts=max_posts,
+                random_order=random_order,
+            )
+            return
+
+        logger.info(
+            "Stratifying search across %d term(s) so no single hashtag/keyword "
+            "can dominate the sample: %s",
+            len(terms), [value for _, value in terms],
+        )
+
+        generators = []
+        for kind, value in terms:
+            if kind == "hashtag":
+                gen = self._search_single_query(
+                    hashtags=[value], keywords=[], start_date=start_date,
+                    end_date=end_date, language=language, max_posts=max_posts,
+                    random_order=random_order,
+                )
+            else:
+                gen = self._search_single_query(
+                    hashtags=[], keywords=[value], start_date=start_date,
+                    end_date=end_date, language=language, max_posts=max_posts,
+                    random_order=random_order,
+                )
+            generators.append(gen)
+
+        seen_post_ids = set()
+        yielded = 0
+        active = list(generators)
+
+        if min_posts_per_term > 0:
+            logger.info(
+                "Reserving up to %d post(s) per term before round-robin fill.",
+                min_posts_per_term,
+            )
+            still_active = []
+            for gen in active:
+                reserved = 0
+                exhausted = False
+                while reserved < min_posts_per_term and yielded < max_posts:
+                    try:
+                        post = next(gen)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    if post.post_id in seen_post_ids:
+                        continue
+                    seen_post_ids.add(post.post_id)
+                    yielded += 1
+                    reserved += 1
+                    yield post
+                if not exhausted:
+                    still_active.append(gen)
+            active = still_active
+
+        while active and yielded < max_posts:
+            still_active = []
+            for gen in active:
+                if yielded >= max_posts:
+                    break
+                try:
+                    post = next(gen)
+                except StopIteration:
+                    continue
+                still_active.append(gen)
+                if post.post_id in seen_post_ids:
+                    continue
+                seen_post_ids.add(post.post_id)
+                yielded += 1
+                yield post
+            active = still_active
+
+        logger.info(
+            "Stratified search complete: %d unique post(s) retrieved across "
+            "%d term(s).", yielded, len(terms),
+        )
+
+    def _search_single_query(
+        self,
+        hashtags: List[str],
+        start_date: date,
+        end_date: date,
+        language: str,
+        max_posts: int,
+        keywords: Optional[List[str]] = None,
+        random_order: bool = False,
+    ) -> Iterator[Post]:
+        """Search with one combined `hashtag_name IN [...] OR keyword IN [...]` query.
 
         Splits the requested window into 30-day chunks (an API limit) and
         paginates within each chunk - but only up to that chunk's fair
@@ -356,6 +483,10 @@ class ResearchApiClient(TikTokClient):
         paginated with cursor/search_id the normal way, or whether it only
         ever returns a single capped batch; TikTok's docs describe it as
         returning "1-100 videos" without being explicit either way.
+
+        This is called directly (via `search_posts`) for the single
+        hashtag/single keyword case, and once per term when stratifying
+        across several hashtags/keywords.
         """
         logger.info(
             "Searching TikTok Research API: tags=%s keywords=%s window=%s..%s lang=%s "
@@ -592,6 +723,7 @@ class ResearchApiClient(TikTokClient):
             comment_count=int(raw.get("comment_count", 0) or 0),
             share_count=int(raw.get("share_count", 0) or 0),
             favorites_count=int(raw.get("favorites_count", 0) or 0),
+            video_duration=int(raw.get("video_duration", 0) or 0),
         )
 
     @staticmethod

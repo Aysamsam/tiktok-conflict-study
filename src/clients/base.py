@@ -39,6 +39,7 @@ class TikTokClient(ABC):
         max_posts: int,
         keywords: Optional[List[str]] = None,
         random_order: bool = False,
+        min_posts_per_term: int = 0,
     ) -> Iterator[Post]:
         """Yield posts matching the study's search criteria.
 
@@ -58,6 +59,12 @@ class TikTokClient(ABC):
                         - which can cluster a whole sample into a narrow
                         time window even when the requested date range is
                         wide. True asks for a random sample instead.
+            min_posts_per_term: With more than one hashtag/keyword, reserve
+                        at least this many posts for each term before
+                        round-robin fills the rest of `max_posts` by
+                        availability. Guards against a high-volume term
+                        crowding out a low-volume one entirely. 0 (default)
+                        disables reservation - pure round-robin, as before.
 
         Yields:
             Fully populated `Post` objects.

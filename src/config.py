@@ -157,12 +157,14 @@ class Settings:
     search_overfetch_factor: int        # Retrieve N x max_posts before filtering
     max_comments_per_post: int          # Per-post comment cap
     min_comments: int                   # Posts below this comment_count are excluded
+    max_video_duration_seconds: int     # Posts longer than this are excluded. 0 = no limit
     require_ai_label: bool              # Keep only posts with an AI content label (any kind)
     require_regions: List[str]          # Keep only posts whose author_region is one of these (empty = no restriction)
     sort_by: str                        # "none" (first match) or "view_count" (most viral first)
     boost_hashtags: List[str]           # Tags that get a ranking multiplier (sort_by=view_count only)
     boost_multiplier: float             # Score multiplier applied when a candidate carries a boost tag
     max_posts_per_account: int          # Cap on posts from one username in the dataset. 0 = unlimited
+    min_posts_per_hashtag: int          # Reserve at least this many posts per hashtag/keyword before round-robin fill. 0 = no reservation
     daily_request_quota: int            # API requests permitted per 24h
 
     # --- Output -------------------------------------------------------
@@ -227,6 +229,9 @@ class Settings:
         if self.min_comments < 0:
             raise ConfigError("STUDY_MIN_COMMENTS must be 0 or greater.")
 
+        if self.max_video_duration_seconds < 0:
+            raise ConfigError("STUDY_MAX_VIDEO_DURATION_SECONDS must be 0 or greater.")
+
         if self.sort_by not in {"none", "view_count"}:
             raise ConfigError(
                 f"STUDY_SORT_BY must be 'none' or 'view_count', got '{self.sort_by}'."
@@ -237,6 +242,9 @@ class Settings:
 
         if self.max_posts_per_account < 0:
             raise ConfigError("STUDY_MAX_POSTS_PER_ACCOUNT must be 0 or greater.")
+
+        if self.min_posts_per_hashtag < 0:
+            raise ConfigError("STUDY_MIN_POSTS_PER_HASHTAG must be 0 or greater.")
 
         if self.client_type not in {"mock", "research_api"}:
             raise ConfigError(
@@ -293,6 +301,8 @@ class Settings:
             f"  Target posts     : {self.max_posts}\n"
             f"  Comments per post: up to {self.max_comments_per_post}\n"
             f"  Min comments     : {self.min_comments}\n"
+            f"  Max duration     : "
+            f"{str(self.max_video_duration_seconds) + 's' if self.max_video_duration_seconds else 'unlimited'}\n"
             f"  AI label only    : {self.require_ai_label}\n"
             f"  Region filter    : "
             f"{', '.join(self.require_regions) if self.require_regions else '(none)'}\n"
@@ -301,6 +311,8 @@ class Settings:
             f"(x{self.boost_multiplier})\n"
             f"  Max per account  : "
             f"{self.max_posts_per_account if self.max_posts_per_account else 'unlimited'}\n"
+            f"  Min per hashtag  : "
+            f"{self.min_posts_per_hashtag if self.min_posts_per_hashtag else 'none (pure round-robin)'}\n"
             f"  Output root      : {self.output_root.resolve()}\n"
             f"  Server transfer  : {self.transfer_mode}"
         )
@@ -370,6 +382,7 @@ def load_settings(env_file: Optional[Path] = None) -> Settings:
         search_overfetch_factor=_get_int("SEARCH_OVERFETCH_FACTOR", default=3),
         max_comments_per_post=_get_int("STUDY_MAX_COMMENTS_PER_POST", default=200),
         min_comments=_get_int("STUDY_MIN_COMMENTS", default=0),
+        max_video_duration_seconds=_get_int("STUDY_MAX_VIDEO_DURATION_SECONDS", default=0),
         require_ai_label=_get_bool("STUDY_REQUIRE_AI_LABEL", default=False),
         require_regions=[
             r.upper() for r in _get_csv_list("STUDY_REQUIRE_REGIONS", default="")
@@ -378,6 +391,7 @@ def load_settings(env_file: Optional[Path] = None) -> Settings:
         boost_hashtags=_get_csv_list("STUDY_BOOST_HASHTAGS", default=""),
         boost_multiplier=_get_float("STUDY_BOOST_MULTIPLIER", default=1.2),
         max_posts_per_account=_get_int("STUDY_MAX_POSTS_PER_ACCOUNT", default=0),
+        min_posts_per_hashtag=_get_int("STUDY_MIN_POSTS_PER_HASHTAG", default=0),
         daily_request_quota=_get_int("DAILY_REQUEST_QUOTA", default=1000),
 
         # --- Output ---------------------------------------------------
