@@ -560,6 +560,103 @@ class ResearchApiClient(TikTokClient):
 
         logger.info("Search complete: %d posts retrieved.", yielded)
 
+    # -----------------------------------------------------------------
+    # Interface method: direct video_id lookup (for known URLs)
+    # -----------------------------------------------------------------
+
+    def fetch_posts_by_ids(
+        self,
+        video_ids: List[str],
+        start_date: date,
+        end_date: date,
+    ) -> Iterator[Post]:
+        """Look up specific videos by ID via `video_id IN [...]`.
+
+        `video_id` is itself in `_QUERYABLE_FIELDS`, so this reuses the same
+        video-query endpoint as `search_posts`, just with a different
+        condition. Ids are batched at `_MAX_PAGE_SIZE` per request (the
+        `IN` value-list limit mirrors the page-size limit), and the date
+        window is split into 30-day chunks the same way `_search_single_query`
+        does, since the endpoint enforces that cap regardless of query type.
+        """
+        remaining_ids = [str(v).strip() for v in video_ids if str(v).strip()]
+        if not remaining_ids:
+            return
+
+        logger.info(
+            "Looking up %d specific video(s) by id, window=%s..%s",
+            len(remaining_ids), start_date, end_date,
+        )
+
+        found_ids = set()
+        chunks = self._split_date_window(start_date, end_date)
+
+        for id_start in range(0, len(remaining_ids), _MAX_PAGE_SIZE):
+            id_batch = remaining_ids[id_start:id_start + _MAX_PAGE_SIZE]
+
+            for chunk_start, chunk_end in chunks:
+                cursor: Optional[int] = None
+                search_id: Optional[str] = None
+
+                while True:
+                    body = self._build_id_lookup_body(
+                        video_ids=id_batch,
+                        start_date=chunk_start,
+                        end_date=chunk_end,
+                        cursor=cursor,
+                        search_id=search_id,
+                    )
+                    data = self._request(
+                        url=self._video_query_url,
+                        params={"fields": ",".join(_VIDEO_FIELDS)},
+                        body=body,
+                    )
+
+                    videos = data.get("videos", [])
+                    for raw_video in videos:
+                        post = self._parse_post(raw_video)
+                        if post is not None and post.post_id not in found_ids:
+                            found_ids.add(post.post_id)
+                            yield post
+
+                    if not data.get("has_more", False):
+                        break
+                    cursor = data.get("cursor")
+                    search_id = data.get("search_id")
+
+        missing = [v for v in remaining_ids if v not in found_ids]
+        if missing:
+            logger.warning(
+                "%d of %d requested video id(s) were not found in "
+                "%s..%s (deleted, private, or outside the window): %s",
+                len(missing), len(remaining_ids), start_date, end_date, missing,
+            )
+
+    def _build_id_lookup_body(
+        self,
+        video_ids: List[str],
+        start_date: date,
+        end_date: date,
+        cursor: Optional[int],
+        search_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Assemble the JSON body for a `video_id IN [...]` lookup request."""
+        body: Dict[str, Any] = {
+            "query": {"and": [{
+                "operation": "IN",
+                "field_name": "video_id",
+                "field_values": video_ids,
+            }]},
+            "start_date": start_date.strftime("%Y%m%d"),
+            "end_date": end_date.strftime("%Y%m%d"),
+            "max_count": _MAX_PAGE_SIZE,
+        }
+        if cursor is not None:
+            body["cursor"] = cursor
+        if search_id is not None:
+            body["search_id"] = search_id
+        return body
+
     def _split_date_window(self, start: date, end: date) -> List[tuple]:
         """Split a date range into consecutive chunks of at most 30 days.
 

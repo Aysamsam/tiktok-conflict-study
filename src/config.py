@@ -160,11 +160,14 @@ class Settings:
     max_video_duration_seconds: int     # Posts longer than this are excluded. 0 = no limit
     require_ai_label: bool              # Keep only posts with an AI content label (any kind)
     require_regions: List[str]          # Keep only posts whose author_region is one of these (empty = no restriction)
+    exclude_regions: List[str]          # Drop posts whose author_region is one of these (empty = no restriction)
+    require_hashtag_contains: str       # Keep only posts with a hashtag containing this substring (empty = no restriction)
     sort_by: str                        # "none" (first match) or "view_count" (most viral first)
     boost_hashtags: List[str]           # Tags that get a ranking multiplier (sort_by=view_count only)
     boost_multiplier: float             # Score multiplier applied when a candidate carries a boost tag
     max_posts_per_account: int          # Cap on posts from one username in the dataset. 0 = unlimited
     min_posts_per_hashtag: int          # Reserve at least this many posts per hashtag/keyword before round-robin fill. 0 = no reservation
+    max_posts_per_hashtag: int          # Cap on saved posts carrying any one study hashtag. 0 = unlimited
     daily_request_quota: int            # API requests permitted per 24h
 
     # --- Output -------------------------------------------------------
@@ -246,6 +249,9 @@ class Settings:
         if self.min_posts_per_hashtag < 0:
             raise ConfigError("STUDY_MIN_POSTS_PER_HASHTAG must be 0 or greater.")
 
+        if self.max_posts_per_hashtag < 0:
+            raise ConfigError("STUDY_MAX_POSTS_PER_HASHTAG must be 0 or greater.")
+
         if self.client_type not in {"mock", "research_api"}:
             raise ConfigError(
                 f"TIKTOK_CLIENT must be 'mock' or 'research_api', "
@@ -306,6 +312,9 @@ class Settings:
             f"  AI label only    : {self.require_ai_label}\n"
             f"  Region filter    : "
             f"{', '.join(self.require_regions) if self.require_regions else '(none)'}\n"
+            f"  Region exclusion : "
+            f"{', '.join(self.exclude_regions) if self.exclude_regions else '(none)'}\n"
+            f"  Hashtag contains : {self.require_hashtag_contains or '(none)'}\n"
             f"  Selection order  : {self.sort_by}\n"
             f"  Rank boost tags  : {', '.join(self.boost_hashtags) if self.boost_hashtags else '(none)'} "
             f"(x{self.boost_multiplier})\n"
@@ -313,6 +322,8 @@ class Settings:
             f"{self.max_posts_per_account if self.max_posts_per_account else 'unlimited'}\n"
             f"  Min per hashtag  : "
             f"{self.min_posts_per_hashtag if self.min_posts_per_hashtag else 'none (pure round-robin)'}\n"
+            f"  Max per hashtag  : "
+            f"{self.max_posts_per_hashtag if self.max_posts_per_hashtag else 'unlimited'}\n"
             f"  Output root      : {self.output_root.resolve()}\n"
             f"  Server transfer  : {self.transfer_mode}"
         )
@@ -387,11 +398,16 @@ def load_settings(env_file: Optional[Path] = None) -> Settings:
         require_regions=[
             r.upper() for r in _get_csv_list("STUDY_REQUIRE_REGIONS", default="")
         ],
+        exclude_regions=[
+            r.upper() for r in _get_csv_list("STUDY_EXCLUDE_REGIONS", default="")
+        ],
+        require_hashtag_contains=_get_str("STUDY_REQUIRE_HASHTAG_CONTAINS", default=""),
         sort_by=_get_str("STUDY_SORT_BY", default="none").lower(),
         boost_hashtags=_get_csv_list("STUDY_BOOST_HASHTAGS", default=""),
         boost_multiplier=_get_float("STUDY_BOOST_MULTIPLIER", default=1.2),
         max_posts_per_account=_get_int("STUDY_MAX_POSTS_PER_ACCOUNT", default=0),
         min_posts_per_hashtag=_get_int("STUDY_MIN_POSTS_PER_HASHTAG", default=0),
+        max_posts_per_hashtag=_get_int("STUDY_MAX_POSTS_PER_HASHTAG", default=0),
         daily_request_quota=_get_int("DAILY_REQUEST_QUOTA", default=1000),
 
         # --- Output ---------------------------------------------------

@@ -79,6 +79,36 @@ class TikTokClient(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def fetch_posts_by_ids(
+        self,
+        video_ids: List[str],
+        start_date: date,
+        end_date: date,
+    ) -> Iterator[Post]:
+        """Yield the specific posts named by `video_ids` (order not guaranteed).
+
+        Unlike `search_posts`, this looks up known videos directly rather
+        than discovering them by hashtag/keyword - the entry point for
+        collecting posts a researcher already has URLs for. A video_id with
+        no matching post (deleted, private, or outside `start_date`/
+        `end_date`) is simply absent from the results, not an error; the
+        caller is responsible for noticing which ids never appeared.
+
+        Args:
+            video_ids:  The numeric TikTok video IDs to look up.
+            start_date: First day to search, inclusive. The Research API
+                        requires a window even for an exact-ID lookup.
+            end_date:   Last day to search, inclusive.
+
+        Yields:
+            One `Post` per video_id that was found.
+
+        Raises:
+            TikTokClientError: On an unrecoverable failure of the data source.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def fetch_comments(self, post_id: str, max_comments: int) -> Iterator[Comment]:
         """Yield comments belonging to one post, newest-first where supported.
 

@@ -67,11 +67,14 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
         max_video_duration_seconds=0,
         require_ai_label=False,
         require_regions=[],
+        exclude_regions=[],
+        require_hashtag_contains="",
         sort_by="none",
         boost_hashtags=[],
         boost_multiplier=1.2,
         max_posts_per_account=0,
         min_posts_per_hashtag=0,
+        max_posts_per_hashtag=0,
         daily_request_quota=1000,
         output_root=tmp_path,
         transfer_mode="none",
@@ -388,6 +391,48 @@ class TestEligibilityFiltering:
     def test_region_not_required_by_default(self, settings):
         assert self._pipeline(settings)._is_eligible(self._post(author_region="US"))
 
+    def test_exclude_regions_excludes_the_named_region(self, tmp_path):
+        settings = make_settings(tmp_path, exclude_regions=["PK"])
+        pipeline = self._pipeline(settings)
+        assert not pipeline._is_eligible(self._post(author_region="PK"))
+        assert pipeline._is_eligible(self._post(author_region="US"))
+
+    def test_exclude_regions_matches_case_insensitively(self, tmp_path):
+        settings = make_settings(tmp_path, exclude_regions=["PK"])
+        pipeline = self._pipeline(settings)
+        assert not pipeline._is_eligible(self._post(author_region="pk"))
+
+    def test_exclude_regions_not_enforced_by_default(self, settings):
+        assert self._pipeline(settings)._is_eligible(self._post(author_region="PK"))
+
+    def test_require_hashtag_contains_excludes_posts_with_no_matching_tag(self, tmp_path):
+        """Primary match can come from a keyword, independent of the hashtags."""
+        settings = make_settings(
+            tmp_path, keywords=["breaking news"], require_hashtag_contains="iran",
+        )
+        pipeline = self._pipeline(settings)
+        post = self._post(caption="breaking news today", hashtags=["fyp", "worldnews"])
+        assert not pipeline._is_eligible(post)
+
+    def test_require_hashtag_contains_includes_posts_with_a_matching_tag(self, tmp_path):
+        settings = make_settings(
+            tmp_path, keywords=["breaking news"], require_hashtag_contains="iran",
+        )
+        pipeline = self._pipeline(settings)
+        post = self._post(caption="breaking news today", hashtags=["fyp", "standwithiran"])
+        assert pipeline._is_eligible(post)
+
+    def test_require_hashtag_contains_matches_case_insensitively(self, tmp_path):
+        settings = make_settings(
+            tmp_path, keywords=["breaking news"], require_hashtag_contains="iran",
+        )
+        pipeline = self._pipeline(settings)
+        post = self._post(caption="breaking news today", hashtags=["fyp", "STANDWITHIRAN"])
+        assert pipeline._is_eligible(post)
+
+    def test_hashtag_contains_not_required_by_default(self, settings):
+        assert self._pipeline(settings)._is_eligible(self._post(hashtags=["Iran"]))
+
     def test_max_duration_excludes_longer_posts(self, tmp_path):
         settings = make_settings(tmp_path, max_video_duration_seconds=30)
         pipeline = self._pipeline(settings)
@@ -480,6 +525,108 @@ class TestAccountCap:
         )
         assert len(read_csv(settings.posts_csv)) == 1
         assert pipeline.stats.posts_skipped_account_cap == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-hashtag cap
+# ---------------------------------------------------------------------------
+
+class TestHashtagCap:
+    """STUDY_MAX_POSTS_PER_HASHTAG must stop one hashtag from dominating the sample."""
+
+    def _post(self, post_id, hashtags, username=None, view_count=100) -> Post:
+        return Post(
+            post_id=post_id,
+            username=username or f"user_{post_id}",
+            author_region="US",
+            create_time="2026-05-15T12:00:00+00:00",
+            caption="a caption long enough to not be treated as undetermined",
+            hashtags=hashtags,
+            video_url="https://example.invalid",
+            has_ai_label=False,
+            view_count=view_count, like_count=0, comment_count=0, share_count=0,
+        )
+
+    def _run(self, settings, posts):
+        pipeline = CollectionPipeline(settings, client=MockTikTokClient(seed=1))
+        settings.ensure_directories()
+        if settings.max_posts_per_account > 0:
+            pipeline._account_counts = pipeline._load_account_counts(settings.posts_csv)
+        if settings.max_posts_per_hashtag > 0:
+            pipeline._hashtag_counts = pipeline._load_hashtag_counts(settings.posts_csv)
+        with open_posts_writer(settings.posts_csv) as posts_writer, \
+             open_comments_writer(settings.comments_csv) as comments_writer:
+            if settings.sort_by == "view_count":
+                pipeline._run_ranked(iter(posts), posts_writer, comments_writer)
+            else:
+                pipeline._run_streaming(iter(posts), posts_writer, comments_writer)
+        return pipeline
+
+    def test_streaming_mode_respects_the_cap(self, tmp_path):
+        settings = make_settings(
+            tmp_path, max_posts=10, max_posts_per_hashtag=1, sort_by="none",
+        )
+        posts = [
+            self._post(str(7_000_000_000_000_000_000 + i), ["Iran"]) for i in range(5)
+        ]
+        pipeline = self._run(settings, posts)
+
+        rows = read_csv(settings.posts_csv)
+        assert len(rows) == 1
+        assert pipeline.stats.posts_skipped_hashtag_cap == 4
+
+    def test_a_post_is_excluded_if_any_carried_tag_is_at_cap(self, tmp_path):
+        """A post with several study hashtags is rejected wholesale, not partially."""
+        settings = make_settings(
+            tmp_path, max_posts=10, max_posts_per_hashtag=1,
+            hashtags=["Iran", "IranWar"], sort_by="none",
+        )
+        posts = [
+            self._post("7000000000000000001", ["Iran"]),
+            # Carries the still-open "IranWar" too, but "Iran" is already full.
+            self._post("7000000000000000002", ["Iran", "IranWar"]),
+            self._post("7000000000000000003", ["IranWar"]),
+        ]
+        pipeline = self._run(settings, posts)
+
+        rows = read_csv(settings.posts_csv)
+        ids = {r["post_id"] for r in rows}
+        assert ids == {"7000000000000000001", "7000000000000000003"}
+        assert pipeline.stats.posts_skipped_hashtag_cap == 1
+
+    def test_ranked_mode_backfills_from_a_hashtag_with_room(self, tmp_path):
+        settings = make_settings(
+            tmp_path, max_posts=2, max_posts_per_hashtag=1,
+            hashtags=["Iran", "IranWar"], sort_by="view_count",
+        )
+        posts = [
+            self._post("7000000000000000001", ["Iran"], view_count=900),
+            self._post("7000000000000000002", ["Iran"], view_count=500),
+            self._post("7000000000000000003", ["IranWar"], view_count=300),
+        ]
+        pipeline = self._run(settings, posts)
+
+        rows = read_csv(settings.posts_csv)
+        ids = {r["post_id"] for r in rows}
+        assert len(rows) == 2
+        assert "7000000000000000001" in ids, "the higher-view #Iran post should win"
+        assert "7000000000000000002" not in ids, "#Iran is capped at one post"
+        assert "7000000000000000003" in ids, "#IranWar should backfill the freed slot"
+        assert pipeline.stats.posts_skipped_hashtag_cap == 1
+
+    def test_cap_holds_across_a_resumed_run(self, tmp_path):
+        """A hashtag's posts from a prior run must still count toward the cap."""
+        settings = make_settings(
+            tmp_path, max_posts=10, max_posts_per_hashtag=1, sort_by="none",
+        )
+        self._run(settings, [self._post("7000000000000000001", ["Iran"])])
+        assert len(read_csv(settings.posts_csv)) == 1
+
+        pipeline = self._run(
+            settings, [self._post("7000000000000000002", ["Iran"])],
+        )
+        assert len(read_csv(settings.posts_csv)) == 1
+        assert pipeline.stats.posts_skipped_hashtag_cap == 1
 
 
 # ---------------------------------------------------------------------------

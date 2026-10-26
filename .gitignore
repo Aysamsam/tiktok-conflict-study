@@ -10,15 +10,20 @@
 #   1. Ethics - the dataset contains personal data (usernames, comment text)
 #      and must live only on approved storage, not on a code host.
 #   2. Reproducibility - the code reproduces the data; the data is an output.
-data/*.csv
+# Recursive (**) so this also covers data/archive/<run>/raw_posts.csv and
+# similar nested outputs, not just the top-level files.
+data/**/*.csv
+data/**/*.txt
 logs/*.log
 
 # Same reasoning applies to per-run archives and their derived summaries
 # under analysis/ - only the reusable scripts and methodology notes (.py,
 # .md) are safe to commit; the data itself and any text derived from it stay
-# local.
+# local. Logs under analysis/ carry the same per-post usernames the top-level
+# logs/*.log rule protects against, so they're excluded too.
 analysis/**/*.csv
 analysis/**/*.txt
+analysis/**/*.log
 
 # Keep the empty directories themselves in the repository so that a fresh
 # clone has the correct structure before the first run.

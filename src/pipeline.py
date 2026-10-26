@@ -62,6 +62,9 @@ class CollectionStats:
     posts_skipped_account_cap: int = 0
     """Eligible posts skipped because their account already hit STUDY_MAX_POSTS_PER_ACCOUNT."""
 
+    posts_skipped_hashtag_cap: int = 0
+    """Eligible posts skipped because one of their study hashtags already hit STUDY_MAX_POSTS_PER_HASHTAG."""
+
     errors: int = 0
     """Non-fatal errors that caused one post to be abandoned."""
 
@@ -82,6 +85,7 @@ class CollectionStats:
             f"  Posts skipped (ineligible): {self.posts_skipped_ineligible}\n"
             f"  Posts skipped (lower rank): {self.posts_skipped_lower_rank}\n"
             f"  Posts skipped (account cap): {self.posts_skipped_account_cap}\n"
+            f"  Posts skipped (hashtag cap): {self.posts_skipped_hashtag_cap}\n"
             f"  Comments saved (new)      : {self.comments_saved}\n"
             f"  Non-fatal errors          : {self.errors}\n"
             "========================================================="
@@ -116,6 +120,12 @@ class CollectionPipeline:
         # known to be in use. Keyed by username.
         self._account_counts: Dict[str, int] = {}
 
+        # Saved posts carrying each study hashtag so far, including prior
+        # runs - populated from disk in `run()` once STUDY_MAX_POSTS_PER_HASHTAG
+        # is known to be in use. Keyed by lowercased study hashtag. A post
+        # carrying several study hashtags increments every one of them.
+        self._hashtag_counts: Dict[str, int] = {}
+
     def _load_account_counts(self, posts_csv: Path) -> Dict[str, int]:
         """Count existing posts per username, so the cap holds across resumed runs."""
         counts: Dict[str, int] = {}
@@ -136,6 +146,51 @@ class CollectionPipeline:
             return False
         return self._account_counts.get(username, 0) >= cap
 
+    def _load_hashtag_counts(self, posts_csv: Path) -> Dict[str, int]:
+        """Count, per study hashtag, how many existing posts carry it.
+
+        So the cap holds across resumed runs - mirrors `_load_account_counts`.
+        """
+        study_tags_lower = {tag.lower() for tag in self.settings.hashtags}
+        counts: Dict[str, int] = {}
+        if not posts_csv.exists() or posts_csv.stat().st_size == 0:
+            return counts
+
+        with open(posts_csv, newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                post_tags_lower = {
+                    tag.strip().lower()
+                    for tag in row.get("hashtags", "").split(",")
+                    if tag.strip()
+                }
+                for tag in post_tags_lower & study_tags_lower:
+                    counts[tag] = counts.get(tag, 0) + 1
+        return counts
+
+    def _hashtag_at_cap(self, post: Post) -> bool:
+        """True if any study hashtag `post` carries already hit STUDY_MAX_POSTS_PER_HASHTAG.
+
+        A post carrying several study hashtags is excluded entirely if any
+        one of them is already full - accepting it would push that tag over
+        its cap, even if the post's other tags still have room.
+        """
+        cap = self.settings.max_posts_per_hashtag
+        if cap <= 0:
+            return False
+        study_tags_lower = {tag.lower() for tag in self.settings.hashtags}
+        post_tags_lower = {tag.lower() for tag in post.hashtags}
+        return any(
+            self._hashtag_counts.get(tag, 0) >= cap
+            for tag in post_tags_lower & study_tags_lower
+        )
+
+    def _record_hashtag_counts(self, post: Post) -> None:
+        """Credit `post` toward the count of every study hashtag it carries."""
+        study_tags_lower = {tag.lower() for tag in self.settings.hashtags}
+        post_tags_lower = {tag.lower() for tag in post.hashtags}
+        for tag in post_tags_lower & study_tags_lower:
+            self._hashtag_counts[tag] = self._hashtag_counts.get(tag, 0) + 1
+
     def run(self) -> CollectionStats:
         """Execute the full collection procedure and return its statistics."""
         settings = self.settings
@@ -146,6 +201,9 @@ class CollectionPipeline:
 
         if settings.max_posts_per_account > 0:
             self._account_counts = self._load_account_counts(settings.posts_csv)
+
+        if settings.max_posts_per_hashtag > 0:
+            self._hashtag_counts = self._load_hashtag_counts(settings.posts_csv)
 
         with open_posts_writer(settings.posts_csv) as posts_writer, \
              open_comments_writer(settings.comments_csv) as comments_writer:
@@ -245,6 +303,16 @@ class CollectionPipeline:
                 )
                 continue
 
+            # --- Step 3c2: has one of its study hashtags hit its cap? ----
+            if self._hashtag_at_cap(post):
+                self.stats.posts_skipped_hashtag_cap += 1
+                logger.debug(
+                    "Post %s skipped: at least one of its study hashtags "
+                    "already hit the cap of %d.",
+                    post.post_id, settings.max_posts_per_hashtag,
+                )
+                continue
+
             try:
                 self._process_post(post, posts_writer, comments_writer)
             except TikTokClientError as exc:
@@ -256,6 +324,7 @@ class CollectionPipeline:
             self._account_counts[post.username] = (
                 self._account_counts.get(post.username, 0) + 1
             )
+            self._record_hashtag_counts(post)
 
             # --- Step 4: reached the target sample size? ----------
             # Measured against the total dataset, not just this run's
@@ -304,21 +373,26 @@ class CollectionPipeline:
         )
 
         # Walk the ranking highest-first, skipping (not stopping for) any
-        # candidate whose account is already at cap - a capped account must
-        # not block a lower-ranked candidate from a different one filling
-        # the slot instead.
+        # candidate whose account or a carried hashtag is already at cap -
+        # a capped account/hashtag must not block a lower-ranked candidate
+        # from a different one filling the slot instead.
         selected: List[Post] = []
-        cap_skipped = 0
+        account_cap_skipped = 0
+        hashtag_cap_skipped = 0
         for post in candidates:
             if len(selected) >= needed:
                 break
             if self._account_at_cap(post.username):
-                cap_skipped += 1
+                account_cap_skipped += 1
+                continue
+            if self._hashtag_at_cap(post):
+                hashtag_cap_skipped += 1
                 continue
             selected.append(post)
             self._account_counts[post.username] = (
                 self._account_counts.get(post.username, 0) + 1
             )
+            self._record_hashtag_counts(post)
 
         for post in selected:
             try:
@@ -328,9 +402,10 @@ class CollectionPipeline:
                 logger.error("Abandoning post %s: %s", post.post_id, exc)
                 continue
 
-        self.stats.posts_skipped_account_cap += cap_skipped
+        self.stats.posts_skipped_account_cap += account_cap_skipped
+        self.stats.posts_skipped_hashtag_cap += hashtag_cap_skipped
         self.stats.posts_skipped_lower_rank += max(
-            0, len(candidates) - len(selected) - cap_skipped
+            0, len(candidates) - len(selected) - account_cap_skipped - hashtag_cap_skipped
         )
 
         logger.info(
@@ -396,6 +471,21 @@ class CollectionPipeline:
             )
             return False
 
+        # Criterion 1b: on top of the primary hashtag/keyword match above,
+        # at least one of the post's hashtags must contain this substring -
+        # a secondary topical-relevance gate distinct from the primary
+        # search criteria (e.g. primary = "iranwar" tag/keyword, secondary
+        # = any hashtag containing "iran", so a post only reachable via a
+        # loosely related keyword match still has to carry an on-topic tag).
+        if self.settings.require_hashtag_contains:
+            needle = self.settings.require_hashtag_contains.lower()
+            if not any(needle in tag.lower() for tag in post.hashtags):
+                logger.debug(
+                    "Excluding post %s: no hashtag contains %r (hashtags: %s).",
+                    post.post_id, self.settings.require_hashtag_contains, post.hashtags,
+                )
+                return False
+
         # Criterion 2: caption must be in the study's target language.
         keep, reason = self.language_filter.matches(post.caption)
         if not keep:
@@ -450,6 +540,16 @@ class CollectionPipeline:
             logger.debug(
                 "Excluding post %s: region %r not in %s.",
                 post.post_id, post.author_region, self.settings.require_regions,
+            )
+            return False
+
+        # Criterion 4c2: author_region must not be in the excluded set, if any.
+        if self.settings.exclude_regions and (
+            post.author_region or ""
+        ).upper() in self.settings.exclude_regions:
+            logger.debug(
+                "Excluding post %s: region %r is in the excluded set %s.",
+                post.post_id, post.author_region, self.settings.exclude_regions,
             )
             return False
 

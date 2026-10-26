@@ -148,6 +148,36 @@ class MockTikTokClient(TikTokClient):
 
     # -- Interface method 2 ------------------------------------------------
 
+    def fetch_posts_by_ids(
+        self,
+        video_ids: List[str],
+        start_date: date,
+        end_date: date,
+    ) -> Iterator[Post]:
+        """Yield one synthetic post per id, deterministically seeded by that id.
+
+        Every id "is found" - the mock has no concept of a deleted or
+        private video - so this exists to exercise the pipeline path, not
+        to model TikTok's actual lookup behaviour.
+        """
+        window_start = int(datetime(
+            start_date.year, start_date.month, start_date.day,
+            tzinfo=timezone.utc,
+        ).timestamp())
+        window_end = int(datetime(
+            end_date.year, end_date.month, end_date.day,
+            23, 59, 59, tzinfo=timezone.utc,
+        ).timestamp())
+
+        for video_id in video_ids:
+            video_id = str(video_id).strip()
+            if not video_id:
+                continue
+            rng = random.Random(f"url-lookup:{video_id}")
+            yield self._make_post_with_id(video_id, rng, ["url_lookup"], window_start, window_end)
+
+    # -- Interface method 3 ------------------------------------------------
+
     def fetch_comments(self, post_id: str, max_comments: int) -> Iterator[Comment]:
         """Yield a synthetic comment thread for `post_id`.
 
@@ -207,11 +237,30 @@ class MockTikTokClient(TikTokClient):
         window_end: int,
     ) -> Post:
         """Fabricate one `Post`. Internal helper; not part of the interface."""
-        rng = self._rng
+        return self._make_post_with_id(
+            post_id=str(self._rng.randint(
+                7_000_000_000_000_000_000, 7_999_999_999_999_999_999,
+            )),
+            rng=self._rng,
+            study_hashtags=study_hashtags,
+            window_start=window_start,
+            window_end=window_end,
+        )
 
-        # 19-digit IDs, matching the real format, to exercise the same
-        # integer-rounding hazard as production data.
-        post_id = str(rng.randint(7_000_000_000_000_000_000, 7_999_999_999_999_999_999))
+    def _make_post_with_id(
+        self,
+        post_id: str,
+        rng: random.Random,
+        study_hashtags: List[str],
+        window_start: int,
+        window_end: int,
+    ) -> Post:
+        """Fabricate one `Post` with a caller-supplied id and RNG.
+
+        `_make_post` (the `search_posts` path, where the id itself is part
+        of what's being fabricated) and `fetch_posts_by_ids` (where the id
+        is a real input, not something to invent) both funnel through here.
+        """
         username = f"MOCK_user_{rng.randint(1000, 9999)}"
 
         # Every post carries at least one study hashtag plus zero to three
